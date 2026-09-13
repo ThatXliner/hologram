@@ -29,7 +29,7 @@ import { PNG } from "pngjs";
 
 const noServer = process.argv.includes("--no-server");
 const force = process.argv.includes("--force");
-const BASE_URL = noServer ? "http://localhost:1420" : "http://localhost:4173";
+const BASE_URL = process.env.HOLOGRAM_UI_URL ?? (noServer ? "http://localhost:1420" : "http://localhost:4173");
 const OUT_DIR = "screenshots";
 const VIEWPORT = { width: 1440, height: 900 };
 const DEVICE_SCALE_FACTOR = 2;
@@ -248,7 +248,7 @@ const MOCK_STATS = {
 
 // ── Tauri mock ────────────────────────────────────────────────────────────────
 
-async function installTauriMock(
+export async function installTauriMock(
     page: Page,
     options: { withPhotos?: boolean } = {},
 ): Promise<void> {
@@ -322,7 +322,7 @@ async function installTauriMock(
  * This bypasses event listeners by directly manipulating Svelte stores
  * via the module system — we import and call photoStore methods.
  */
-async function seedPhotos(page: Page): Promise<void> {
+export async function seedPhotos(page: Page): Promise<void> {
     await page.evaluate(
         (payload: { photos: MockPhoto[]; stats: typeof MOCK_STATS }) => {
             // The app uses a Svelte writable store. We can't import it directly,
@@ -422,7 +422,7 @@ async function waitForPhotoPreviews(page: Page): Promise<void> {
     );
 }
 
-function resolveChromiumExecutable(): string | undefined {
+export function resolveChromiumExecutable(): string | undefined {
     if (existsSync(chromium.executablePath())) return chromium.executablePath();
 
     const candidates = [
@@ -491,11 +491,11 @@ async function scenarioGrid(ctx: BrowserContext): Promise<void> {
     await page.waitForTimeout(1000);
 
     // Check if we see the photo grid (count heading)
-    const hasGrid = await page.locator("text=visible").isVisible().catch(() => false);
+    const hasGrid = await page.locator("[data-photo-card]").first().isVisible().catch(() => false);
     if (!hasGrid) {
         // Fallback: click Import Photos and mock the dialog response
         console.log("  (seeding via import button fallback)");
-        const importBtn = page.locator("text=Import Photos");
+        const importBtn = page.getByRole("button", { name: "Open photo folder", exact: true });
         if (await importBtn.isVisible()) {
             await importBtn.click();
             await page.waitForTimeout(2000);
@@ -533,9 +533,9 @@ async function scenarioGridFiltered(ctx: BrowserContext): Promise<void> {
     await page.waitForTimeout(1000);
 
     // If no grid visible, try import fallback
-    const hasGrid = await page.locator("text=visible").isVisible().catch(() => false);
+    const hasGrid = await page.locator("[data-photo-card]").first().isVisible().catch(() => false);
     if (!hasGrid) {
-        const importBtn = page.locator("text=Import Photos");
+        const importBtn = page.getByRole("button", { name: "Open photo folder", exact: true });
         if (await importBtn.isVisible()) {
             await importBtn.click();
             await page.waitForTimeout(2000);
@@ -543,7 +543,7 @@ async function scenarioGridFiltered(ctx: BrowserContext): Promise<void> {
     }
 
     // Expand filters
-    const filterToggle = page.locator("text=Advanced Filters").locator("..").locator("button").last();
+    const filterToggle = page.getByRole("button", { name: "Show filters", exact: true });
     if (await filterToggle.isVisible()) {
         await filterToggle.click();
         await page.waitForTimeout(300);
@@ -587,9 +587,9 @@ async function scenarioViewer(ctx: BrowserContext): Promise<void> {
     await page.waitForTimeout(1000);
 
     // Try import fallback if needed
-    const hasGrid = await page.locator("text=visible").isVisible().catch(() => false);
+    const hasGrid = await page.locator("[data-photo-card]").first().isVisible().catch(() => false);
     if (!hasGrid) {
-        const importBtn = page.locator("text=Import Photos");
+        const importBtn = page.getByRole("button", { name: "Open photo folder", exact: true });
         if (await importBtn.isVisible()) {
             await importBtn.click();
             await page.waitForTimeout(2000);
@@ -637,9 +637,9 @@ async function scenarioViewerPaired(ctx: BrowserContext): Promise<void> {
     );
     await page.waitForTimeout(1000);
 
-    const hasGrid = await page.locator("text=visible").isVisible().catch(() => false);
+    const hasGrid = await page.locator("[data-photo-card]").first().isVisible().catch(() => false);
     if (!hasGrid) {
-        const importBtn = page.locator("text=Import Photos");
+        const importBtn = page.getByRole("button", { name: "Open photo folder", exact: true });
         if (await importBtn.isVisible()) {
             await importBtn.click();
             await page.waitForTimeout(2000);
@@ -681,9 +681,9 @@ async function scenarioEditor(ctx: BrowserContext): Promise<void> {
     );
     await page.waitForTimeout(1000);
 
-    const hasGrid = await page.locator("text=visible").isVisible().catch(() => false);
+    const hasGrid = await page.locator("[data-photo-card]").first().isVisible().catch(() => false);
     if (!hasGrid) {
-        const importBtn = page.locator("text=Import Photos");
+        const importBtn = page.getByRole("button", { name: "Open photo folder", exact: true });
         if (await importBtn.isVisible()) {
             await importBtn.click();
             await page.waitForTimeout(2000);
@@ -809,7 +809,9 @@ async function main(): Promise<void> {
     }
 }
 
-main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-});
+if (import.meta.main) {
+    main().catch((err) => {
+        console.error(err);
+        process.exit(1);
+    });
+}
