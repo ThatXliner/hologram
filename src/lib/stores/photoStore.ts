@@ -268,10 +268,11 @@ export const filteredPhotos = derived(
 );
 
 // Display photos: collapse paired RAW+JPEG into single entries (prefer JPEG for display)
-export const displayPhotos = derived(filteredPhotos, ($photos) => {
+function collapsePairs(items: Photo[]): Photo[] {
   const seen = new Set<string>();
   const result: Photo[] = [];
-  for (const photo of $photos) {
+  const byId = new Map(items.map((photo) => [photo.id, photo]));
+  for (const photo of items) {
     if (seen.has(photo.id)) continue;
     seen.add(photo.id);
     if (photo.paired_with) {
@@ -280,7 +281,7 @@ export const displayPhotos = derived(filteredPhotos, ($photos) => {
       const isRaw = RAW_FILE_TYPES.has(photo.file_type);
       if (isRaw) {
         // Find the JPEG pair and show that instead, but keep the RAW reference
-        const jpegPair = $photos.find((p) => p.id === photo.paired_with);
+        const jpegPair = byId.get(photo.paired_with);
         if (jpegPair) {
           result.push(jpegPair);
           continue;
@@ -290,7 +291,10 @@ export const displayPhotos = derived(filteredPhotos, ($photos) => {
     result.push(photo);
   }
   return result;
-});
+}
+
+export const displayPhotos = derived(filteredPhotos, collapsePairs);
+export const libraryPhotos = derived(photos, collapsePairs);
 
 export const currentFilter = derived(
   photoStore,

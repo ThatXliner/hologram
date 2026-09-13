@@ -154,8 +154,13 @@ Useful project commands:
 ```bash
 bun run check        # Svelte and TypeScript diagnostics
 bun run build        # Production frontend build
+bun run check:ui     # Browser workflow checks (requires a running dev server)
 bun run screenshots  # Regenerate deterministic product screenshots
 ```
+
+Browser checks use local photo fixtures and mocked Tauri commands. Set `HOLOGRAM_UI_URL`
+when the dev server uses another port, for example `HOLOGRAM_UI_URL=http://127.0.0.1:1430 bun run check:ui`.
+They cover folder entry, filters, saved searches, photo review, export scope, and the 800×600 layout.
 
 ## Principles
 

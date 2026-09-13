@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onDestroy, onMount, tick } from "svelte";
-    import { photoStore, selectedIndex } from "../stores/photoStore.ts";
+    import { photoStore, selectedIndex, viewMode } from "../stores/photoStore.ts";
     import type { CullFlag, Photo } from "../types.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
 
@@ -114,15 +114,19 @@
             visibleCount = Math.min(photos.length, next + batchSize(normalizedTileMinWidth));
         }
         await tick();
-        gridEl?.querySelector(`[data-photo-index="${next}"]`)?.scrollIntoView({
+        const selectedCard = gridEl?.querySelector<HTMLElement>(`[data-photo-index="${$selectedIndex}"]`);
+        selectedCard?.focus({ preventScroll: true });
+        selectedCard?.scrollIntoView({
             block: "nearest",
             inline: "nearest",
         });
     }
 
     function handleKeydown(event: KeyboardEvent) {
+        if ($viewMode === "viewer" || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
         const target = event.target as HTMLElement;
-        if (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName)) return;
+        if (target.closest("input, textarea, select, dialog, [contenteditable=true]")) return;
+        if ((event.key === "Enter" || event.key === " ") && target.closest("button, summary")) return;
 
         const current = photos[$selectedIndex];
         if (!current) return;
@@ -179,6 +183,7 @@
     }
 
     function handleTileKeydown(event: KeyboardEvent, index: number) {
+        if (event.target !== event.currentTarget) return;
         if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             openPhoto(index);
@@ -220,7 +225,8 @@
                 data-photo-card
                 data-photo-index={i}
                 role="button"
-                tabindex="-1"
+                tabindex={i === $selectedIndex ? 0 : -1}
+                aria-label={photo.file_name}
                 aria-current={i === $selectedIndex}
                 onclick={() => selectPhoto(i)}
                 ondblclick={() => openPhoto(i)}

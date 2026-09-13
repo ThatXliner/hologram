@@ -157,6 +157,15 @@
     cursor: pointer;
   }
 
+  :where(button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 3px;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
   ::selection {
     background: color-mix(in oklab, var(--color-primary) 28%, transparent);
   }

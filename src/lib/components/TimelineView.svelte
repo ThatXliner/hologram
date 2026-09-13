@@ -89,6 +89,12 @@
                             class="photo-tile group relative overflow-hidden rounded-lg border bg-card text-left transition-colors {index === $selectedIndex ? 'border-primary' : 'border-border hover:border-primary/60'}"
                             onclick={() => selectPhoto(photo)}
                             ondblclick={() => openPhoto(photo)}
+                            onkeydown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    openPhoto(photo);
+                                }
+                            }}
                             title={photo.file_name}
                         >
                             <div class="relative aspect-[3/2] bg-black">

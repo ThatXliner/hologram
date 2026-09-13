@@ -1,11 +1,11 @@
 <script lang="ts">
-    import { photoStore, stats } from "../stores/photoStore.ts";
-    import { HologramAPI } from "../api.ts";
-    import type { ExifData, Photo, PhotoFilter, SavedSearch, SmartCollection, ThumbnailReady, VisualIndexProgress } from "../types.ts";
+    import { isLoading, libraryPhotos, stats } from "../stores/photoStore.ts";
+    import type { ExifData, Photo, PhotoFilter, SavedSearch, SmartCollection, VisualIndexProgress } from "../types.ts";
     import {
         Check,
         FolderOpen,
-        Lock,
+        Sparkles,
+        SlidersHorizontal,
         Plus,
         Trash2,
         X,
@@ -15,6 +15,10 @@
         photos: Photo[];
         allPhotos: Photo[];
         filter?: PhotoFilter;
+        folderName: string;
+        folderPath: string;
+        onImport: () => void;
+        onClose: () => void;
         savedSearches?: SavedSearch[];
         activeSavedSearchId?: string | null;
         smartCollections?: SmartCollection[];
@@ -33,6 +37,7 @@
         photos,
         allPhotos,
         filter = {},
+        folderName, folderPath, onImport, onClose,
         savedSearches = [],
         activeSavedSearchId = null,
         smartCollections = [],
@@ -48,18 +53,18 @@
     }: Props = $props();
 
     let activeFilter = $state<PhotoFilter>({});
-    let showFilters = $state(false);
+    let showFilters = $state(true);
     let showAddFilter = $state(false);
     let tagFilterInput = $state("");
     let lastExternalFilter = $state("");
 
-    const pickedCount = $derived(allPhotos.filter((photo) => photo.flag === "pick").length);
-    const rejectedCount = $derived(allPhotos.filter((photo) => photo.flag === "reject").length);
-    const ratedCount = $derived(allPhotos.filter((photo) => (photo.rating ?? 0) > 0).length);
+    const pickedCount = $derived($libraryPhotos.filter((photo) => photo.flag === "pick").length);
+    const rejectedCount = $derived($libraryPhotos.filter((photo) => photo.flag === "reject").length);
+    const ratedCount = $derived($libraryPhotos.filter((photo) => (photo.rating ?? 0) > 0).length);
     const reviewedCount = $derived(
-        allPhotos.filter((photo) => photo.flag === "pick" || photo.flag === "reject" || (photo.rating ?? 0) > 0).length,
+        $libraryPhotos.filter((photo) => photo.flag === "pick" || photo.flag === "reject" || (photo.rating ?? 0) > 0).length,
     );
-    const reviewPct = $derived(allPhotos.length ? Math.round((reviewedCount / allPhotos.length) * 100) : 0);
+    const reviewPct = $derived($libraryPhotos.length ? Math.round((reviewedCount / $libraryPhotos.length) * 100) : 0);
 
     const selectFields: { exifKey: keyof ExifData; label: string; filterKey: keyof PhotoFilter }[] = [
         { exifKey: "camera_model", label: "Camera Model", filterKey: "camera_model" },
@@ -136,28 +141,6 @@
             addedFilterKeys = new Set([...addedFilterKeys, ...keys]);
         }
     });
-
-    async function importFolder() {
-        const folderPath = await HologramAPI.selectFolder();
-        if (folderPath) {
-            try {
-                photoStore.setLoading(true);
-                const result = await HologramAPI.scanFolder(
-                    folderPath,
-                    (data: ThumbnailReady) => {
-                        photoStore.setThumbnail(data.id, data.thumbnail, data.embedded_jpeg_preview);
-                    },
-                );
-                photoStore.setPhotos(result.photos);
-                photoStore.setStats(result.stats);
-                photoStore.loadMetadata(result.photos.map((photo) => photo.id));
-            } catch (error) {
-                console.error("Failed to import folder:", error);
-            } finally {
-                photoStore.setLoading(false);
-            }
-        }
-    }
 
     function addFilter(key: string) {
         addedFilterKeys = new Set([...addedFilterKeys, key]);
@@ -303,60 +286,49 @@
         }
     }
 
-    const redundantRawCount = $derived($stats?.raw_count ?? 0);
 </script>
 
 {#snippet deckLabel(text: string)}
-    <div class="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-subtle">{text}</div>
+    <div class="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">{text}</div>
 {/snippet}
 
-<aside class="flex h-full w-[248px] shrink-0 flex-col border-r border-sidebar-border bg-card text-foreground">
+<aside id="library-filters" aria-label="Library filters" class="flex h-full w-[232px] shrink-0 flex-col border-r border-sidebar-border bg-card text-foreground">
     <div class="flex min-h-0 flex-1 flex-col gap-[18px] overflow-y-auto p-[14px_14px_16px]">
         <!-- LIBRARY -->
         <section>
-            {@render deckLabel("Library")}
-            <div class="text-[13px] font-semibold text-foreground">
-                {allPhotos.length > 0 ? "Current library" : "No library"}
+            <div class="mb-3 flex items-center justify-between">
+                <span class="text-xs font-semibold text-muted-foreground">Library</span>
+                <button class="grid h-7 w-7 place-items-center rounded text-muted-foreground hover:bg-secondary min-[1100px]:hidden" onclick={onClose} aria-label="Close library filters"><X size={15} /></button>
             </div>
-            {#if $stats}
-                <div class="mt-1 font-mono text-[11px] text-muted-foreground">
-                    {formatNumber($stats.total_photos)} photos · {formatNumber($stats.paired_count)} RAW+JPEG pairs
-                </div>
-                {#if redundantRawCount > 0}
-                    <div class="mt-[6px] rounded-md border border-border bg-background p-[7px_8px] font-mono text-[10px] leading-[1.5] text-subtle">
-                        ◈ {formatNumber(redundantRawCount)} RAW files carry embedded JPEG previews — Hologram reads them for instant thumbnails.
-                    </div>
-                {/if}
-            {/if}
-            <button
-                class="mt-[8px] flex h-8 w-full items-center justify-center gap-2 rounded-md border border-primary/40 text-[11px] font-semibold text-primary transition-colors hover:bg-primary/10"
-                onclick={importFolder}
-            >
-                <FolderOpen size={14} />
-                {allPhotos.length > 0 ? "Import another folder" : "Import photos"}
+            <div class="truncate text-sm font-semibold" title={folderPath}>{folderName}</div>
+            <div class="mt-1 text-xs leading-relaxed text-muted-foreground">{$libraryPhotos.length} photos · {allPhotos.length} files</div>
+            {#if $stats && $stats.paired_count > 0}<div class="mt-1 text-[11px] text-muted-foreground">{$stats.paired_count} RAW+JPEG pairs shown together</div>{/if}
+            <button class="mt-3 flex h-8 w-full items-center justify-center gap-2 rounded-md border border-input text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:opacity-40" onclick={onImport} disabled={$isLoading}>
+                <FolderOpen size={14} /> Open another folder
             </button>
+            <p class="mt-2 text-[11px] leading-relaxed text-muted-foreground">Switches the current library. Your review decisions are saved.</p>
         </section>
 
         <!-- SESSION -->
         {#if allPhotos.length > 0}
             <section>
                 <div class="mb-2 flex items-baseline justify-between">
-                    {@render deckLabel("Session")}
+                    {@render deckLabel("Review progress")}
                     <span class="font-mono text-[10px] font-semibold text-muted-foreground">{reviewPct}% reviewed</span>
                 </div>
                 <div class="h-1 overflow-hidden rounded-full bg-secondary">
                     <div class="h-full rounded-full bg-primary" style:width={progressWidth(reviewPct)}></div>
                 </div>
-                <div class="mt-[10px] grid grid-cols-3 gap-[6px] font-mono text-[11px]">
-                    <div class="rounded-md bg-secondary p-2">
-                        <div class="flex items-center gap-1 text-pick"><Check size={12} />pick</div>
+                <div class="mt-[10px] grid grid-cols-3 gap-[6px] text-[11px]">
+                    <div class="rounded-md bg-secondary p-1.5">
+                        <div class="flex items-center gap-1 text-pick"><Check size={12} />picks</div>
                         <div class="mt-[2px] text-[15px] font-semibold tabular-nums text-foreground">{pickedCount}</div>
                     </div>
-                    <div class="rounded-md bg-secondary p-2">
-                        <div class="flex items-center gap-1 text-reject"><X size={12} />rej</div>
+                    <div class="rounded-md bg-secondary p-1.5">
+                        <div class="flex items-center gap-1 text-reject"><X size={12} />rejects</div>
                         <div class="mt-[2px] text-[15px] font-semibold tabular-nums text-foreground">{rejectedCount}</div>
                     </div>
-                    <div class="rounded-md bg-secondary p-2">
+                    <div class="rounded-md bg-secondary p-1.5">
                         <div class="text-rating">★ rated</div>
                         <div class="mt-[2px] text-[15px] font-semibold tabular-nums text-foreground">{ratedCount}</div>
                     </div>
@@ -376,14 +348,15 @@
                 {#each activeFilterChips as chip (chip.key)}
                     <span class="inline-flex items-center gap-1 rounded-full border border-primary/40 px-2 py-[3px] font-mono text-[10px] text-primary">
                         {chip.label}
-                        <button onclick={() => removeFilterChip(chip.key)} class="hover:text-foreground" aria-label="Remove filter">✕</button>
+                        <button onclick={() => removeFilterChip(chip.key)} class="hover:text-foreground" aria-label={`Remove ${chip.label} filter`}>✕</button>
                     </span>
                 {/each}
                 <button
                     class="inline-flex items-center gap-1 rounded-full border border-dashed border-white/20 px-2 py-[3px] font-mono text-[10px] text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
                     onclick={() => (showFilters = !showFilters)}
+                    aria-expanded={showFilters}
                 >
-                    <Plus size={11} />{showFilters ? "done" : "add filter"}
+                    <SlidersHorizontal size={12} />{showFilters ? "Hide filters" : "Show filters"}
                 </button>
             </div>
 
@@ -403,7 +376,7 @@
                                 bind:value={activeFilter[filter.filterKey]}
                                 onchange={applyFilter}
                             >
-                                <option value="">All</option>
+                                <option value={undefined}>All</option>
                                 {#each filter.options as opt}
                                     <option value={opt}>{opt}</option>
                                 {/each}
@@ -425,7 +398,7 @@
                                 bind:value={activeFilter.file_type}
                                 onchange={applyFilter}
                             >
-                                <option value="">All Types</option>
+                                <option value={undefined}>All types</option>
                                 {#each fileTypeOptions as type}
                                     <option value={type}>{type}</option>
                                 {/each}
@@ -558,7 +531,7 @@
                                 <span class="block truncate">{saved.name}</span>
                             </button>
                             <button
-                                class="grid h-6 w-6 shrink-0 place-items-center rounded-md text-subtle opacity-0 transition-opacity hover:text-reject group-hover:opacity-100"
+                                class="grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:text-reject"
                                 onclick={() => onSavedSearchDelete(saved.id)}
                                 title="Delete saved search"
                             >
@@ -584,11 +557,11 @@
 
                 {#if !smartCollectionsEnabled}
                     <button
-                        class="w-full rounded-md border border-dashed border-white/15 p-[9px_10px] text-left font-sans text-[11px] leading-[1.5] text-subtle transition-colors hover:border-primary/50"
+                        class="w-full rounded-md border border-dashed border-white/15 p-[9px_10px] text-left font-sans text-[11px] leading-[1.5] text-muted-foreground transition-colors hover:border-primary/50"
                         onclick={onSmartCollectionsTitleClick}
                     >
-                        <Lock size={11} class="mb-[3px] inline text-subtle" /> Locked — enable local visual indexing to group by scene &amp; similarity.
-                        <span class="text-primary">Set up…</span>
+                        <Sparkles size={13} class="mb-[3px] inline text-primary" /> Group similar photos automatically.
+                        <span class="mt-1 block text-primary">Set up smart collections</span>
                     </button>
                 {:else}
                     {#if smartCollectionsIndexing}

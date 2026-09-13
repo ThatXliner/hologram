@@ -1278,6 +1278,7 @@
                 class="rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-subtle transition-colors hover:text-foreground"
                 onclick={(event) => { event.stopPropagation(); closeViewer(); }}
                 title="Close"
+                aria-label="Close viewer"
             >ESC</button>
             <span class="truncate font-mono text-[12px] font-semibold text-foreground">{activePhoto.file_name}</span>
 

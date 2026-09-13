@@ -14,7 +14,8 @@
     "tauri": "tauri",
     "screenshots": "bun scripts/screenshots.ts",
     "screenshots:no-server": "bun scripts/screenshots.ts --no-server",
-    "bump": "bash scripts/bump-version.sh"
+    "bump": "bash scripts/bump-version.sh",
+    "check:ui": "node --experimental-strip-types scripts/ui-smoke.ts"
   },
   "license": "MIT",
   "dependencies": {
