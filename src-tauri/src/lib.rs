@@ -33,6 +33,7 @@ use raw_preview::{
     render_raw_to_jpeg, EmbeddedJpegPreview,
 };
 const THUMBNAIL_CACHE_VERSION: &str = "thumbnail-v1-400px-jpeg90";
+const EXPORT_FOLDER_MARKER: &str = ".hologram-export";
 // Higher than current still-camera dimensions, so cached RAW renders retain
 // their decoded resolution while still using the shared bounded API.
 const RAW_FULL_RENDER_MAX_DIMENSION: u32 = 32_768;
@@ -653,18 +654,26 @@ fn load_full_resolution_image(file_path: &Path) -> Response {
     tauri::ipc::Response::new(data)
 }
 
+fn photo_paths_in_folder(folder_path: &Path) -> Vec<PathBuf> {
+    WalkDir::new(folder_path)
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !entry.path().join(EXPORT_FOLDER_MARKER).is_file()
+        })
+        .filter_map(|e| e.ok())
+        .map(|entry| entry.path().to_path_buf())
+        .filter(|path| is_supported_file(path))
+        .collect()
+}
+
 /// Phase 1: Fast scan — metadata + EXIF only, no image decoding.
 /// Returns photos (with thumbnail: None) and computed stats.
 #[tauri::command]
 async fn scan_folder_fast(folder_path: String, app: AppHandle) -> Result<ScanResult, String> {
-    let paths: Vec<std::path::PathBuf> = WalkDir::new(&folder_path)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .map(|entry| entry.path().to_path_buf())
-        .filter(|path| is_supported_file(path))
-        .collect();
-
+    let paths = photo_paths_in_folder(Path::new(&folder_path));
     let total_files = paths.len();
 
     // Use rayon for parallel EXIF extraction (CPU-bound, no image decoding)
@@ -1959,6 +1968,145 @@ fn xmp_sidecar_path(path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exports_keeper_pairs_without_moving_or_overwriting_originals() {
+        let root = std::env::temp_dir().join(format!("hologram-export-{}", uuid::Uuid::new_v4()));
+        let source = root.join("shoot");
+        let destination = source.join("culled");
+        fs::create_dir_all(&source).unwrap();
+        let fixtures = [
+            (
+                "keeper.jpg",
+                "JPEG",
+                "pick",
+                Some("keeper.NEF"),
+                b"keeper jpeg".as_slice(),
+            ),
+            (
+                "keeper.NEF",
+                "NEF",
+                "pick",
+                Some("keeper.jpg"),
+                b"keeper raw".as_slice(),
+            ),
+            ("reject.jpg", "JPEG", "reject", None, b"rejected".as_slice()),
+            ("unmarked.jpg", "JPEG", "none", None, b"unmarked".as_slice()),
+        ];
+        let library: Vec<Photo> = fixtures
+            .iter()
+            .map(|(name, file_type, flag, paired_with, bytes)| {
+                let path = source.join(name);
+                fs::write(&path, bytes).unwrap();
+                serde_json::from_value(serde_json::json!({
+                    "id": name,
+                    "file_path": path.to_string_lossy(),
+                    "file_name": name,
+                    "file_size": bytes.len(),
+                    "file_type": file_type,
+                    "exif": {},
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "modified_at": "2026-01-01T00:00:00Z",
+                    "flag": flag,
+                    "paired_with": paired_with,
+                }))
+                .unwrap()
+            })
+            .collect();
+        let options = ExportOptions {
+            destination_path: destination.to_string_lossy().to_string(),
+            mode: "folder".to_string(),
+            pair_mode: "both".to_string(),
+            organize_by: "flat".to_string(),
+            rename_pattern: None,
+            include_metadata: false,
+        };
+
+        let result = export_photos(vec![library[0].clone()], library.clone(), options.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.exported_count, 2);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(Path::new(&result.output_path), destination);
+        assert_eq!(photo_paths_in_folder(&destination).len(), 2);
+        assert!(destination.join(EXPORT_FOLDER_MARKER).is_file());
+        assert_eq!(photo_paths_in_folder(&source).len(), 4);
+        assert_eq!(
+            fs::read(destination.join("keeper.jpg")).unwrap(),
+            b"keeper jpeg"
+        );
+        assert_eq!(
+            fs::read(destination.join("keeper.NEF")).unwrap(),
+            b"keeper raw"
+        );
+        assert!(!destination.join("reject.jpg").exists());
+        assert!(!destination.join("unmarked.jpg").exists());
+
+        fs::write(destination.join("keeper.jpg"), b"existing destination").unwrap();
+        let repeated = export_photos(vec![library[0].clone()], library.clone(), options.clone())
+            .await
+            .unwrap();
+        assert_eq!(repeated.exported_count, 2);
+        assert_eq!(photo_paths_in_folder(&destination).len(), 4);
+        assert_eq!(
+            fs::read(destination.join("keeper.jpg")).unwrap(),
+            b"existing destination"
+        );
+        assert_eq!(
+            fs::read(destination.join("keeper-2.jpg")).unwrap(),
+            b"keeper jpeg"
+        );
+        assert_eq!(
+            fs::read(destination.join("keeper.NEF")).unwrap(),
+            b"keeper raw"
+        );
+        assert_eq!(
+            fs::read(destination.join("keeper-2.NEF")).unwrap(),
+            b"keeper raw"
+        );
+        for (name, _, _, _, bytes) in fixtures {
+            assert_eq!(fs::read(source.join(name)).unwrap(), bytes);
+        }
+
+        let existing_destination = source.join("ordinary").join("culled");
+        fs::create_dir_all(&existing_destination).unwrap();
+        let existing_original = existing_destination.join("original.jpg");
+        fs::write(&existing_original, b"existing original").unwrap();
+        export_photos(
+            vec![library[0].clone()],
+            library.clone(),
+            ExportOptions {
+                destination_path: existing_destination.to_string_lossy().to_string(),
+                ..options.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!existing_destination.join(EXPORT_FOLDER_MARKER).exists());
+        let paths = photo_paths_in_folder(&source);
+        assert_eq!(paths.len(), 7);
+        assert!(paths.contains(&existing_original));
+
+        export_photos(
+            vec![library[0].clone()],
+            library,
+            ExportOptions {
+                destination_path: source.to_string_lossy().to_string(),
+                ..options
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!source.join(EXPORT_FOLDER_MARKER).exists());
+        assert_eq!(photo_paths_in_folder(&source).len(), 9);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+}
+
 fn metadata_csv(rows: &[(Photo, String)]) -> String {
     let mut csv = String::from("file_name,relative_path,original_path,rating,flag,tags,notes\n");
     for (photo, relative_path) in rows {
@@ -2113,7 +2261,17 @@ async fn export_photos(
             });
         }
 
-        fs::create_dir_all(&output_path).map_err(|e| e.to_string())?;
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        match fs::create_dir(&output_path) {
+            Ok(()) => {
+                fs::write(output_path.join(EXPORT_FOLDER_MARKER), b"Hologram export\n")
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.to_string()),
+        }
 
         for (idx, photo) in selected.iter().enumerate() {
             let src = Path::new(&photo.file_path);

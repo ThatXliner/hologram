@@ -45,6 +45,7 @@
     type GridDetails = "image" | "essentials" | "metadata";
     type LibraryView = "grid" | "timeline";
     type RailView = "library" | "autocull" | "export" | "settings";
+    type ExportContext = { kind: "library" } | { kind: "autocull"; folderPath: string | null; photoIds: string[] };
     const GRID_PREFERENCES_KEY = "hologram.gridPreferences";
     const GRID_ZOOM_STEPS = [120, 150, 180, 220, 270, 340, 430, 520] as const;
     const DEFAULT_GRID_ZOOM_LEVEL = 3;
@@ -59,6 +60,7 @@
     let libraryView = $state<LibraryView>("grid");
     let railView = $state<RailView>("library");
     let autoCullVisited = $state(false);
+    let exportContext = $state<ExportContext>({ kind: "library" });
     let searchInput = $state<HTMLInputElement>();
     let savedSearches = $state<SavedSearch[]>([]);
     let activeSavedSearchId = $state<string | null>(null);
@@ -76,6 +78,25 @@
     const searchCache = new Map<string, { key: string; text: string }>();
 
     const hasLibrary = $derived($photos.length > 0);
+    const exportPhotos = $derived.by(() => {
+        if (exportContext.kind === "library") return $displayPhotos;
+        if (exportContext.folderPath !== HologramAPI.getActiveFolderPath()) return [];
+        const ids = new Set(exportContext.photoIds);
+        return $photos.filter((photo) => ids.has(photo.id) && photo.flag === "pick");
+    });
+    const keeperDestination = $derived(exportContext.kind === "autocull" && exportContext.folderPath
+        ? `${exportContext.folderPath.replace(/[\\/]$/, "")}/culled` : "");
+
+    function exportKeepers(photoIds: string[]) {
+        exportContext = { kind: "autocull", folderPath: HologramAPI.getActiveFolderPath(), photoIds };
+        railView = "export";
+    }
+
+    function openLibraryExport() {
+        exportContext = { kind: "library" };
+        railView = "export";
+    }
+
     const cursorPhoto = $derived($displayPhotos[$selectedIndex]);
     const smartCollections = $derived(
         smartCollectionsEnabled ? buildSmartCollections($photos, visualIndex) : [],
@@ -405,6 +426,7 @@
             );
             photoStore.setPhotos(result.photos);
             photoStore.setStats(result.stats);
+            exportContext = { kind: "library" };
             photoStore.loadMetadata(result.photos.map((photo) => photo.id));
         } catch (error) {
             console.error("Failed to import folder:", error);
@@ -553,20 +575,39 @@
     </button>
 {/snippet}
 
+{#snippet exportScreen()}
+    <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div class="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-3 text-xs text-muted-foreground">
+            {#if exportContext.kind === "autocull"}
+                <button class="ui-control" onclick={() => (railView = "autocull")}>Back to AutoCull</button>
+                <span>Export AutoCull keepers · {exportPhotos.length} kept photos</span>
+            {:else}
+                <button class="ui-control" onclick={() => (railView = "library")}>Back to library</button>
+                <span>Exporting visible library · {exportPhotos.length} photos</span>
+            {/if}
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto">
+            {#key exportContext}
+                <ExportPanel photos={exportPhotos} allPhotos={$photos} keepers={exportContext.kind === "autocull"} defaultDestination={keeperDestination} />
+            {/key}
+        </div>
+    </div>
+{/snippet}
+
 <div class="flex h-screen overflow-hidden bg-background text-foreground">
     <!-- ICON RAIL -->
     <nav class="flex w-[52px] shrink-0 flex-col items-center gap-1.5 border-r border-border bg-rail py-3">
         <div class="mb-3.5 h-5 w-5 rotate-45 rounded border-2 border-primary" title="Hologram"></div>
         {@render railBtn(LayoutGrid, effectiveRail === "library", "Grid", () => (railView = "library"))}
         {@render railBtn(Sparkles, effectiveRail === "autocull", "AutoCull", () => { if (hasLibrary) railView = "autocull"; }, isVisualIndexing)}
-        {@render railBtn(Download, effectiveRail === "export", "Export", () => { if (hasLibrary) railView = "export"; })}
+        {@render railBtn(Download, effectiveRail === "export", "Export", () => { if (hasLibrary) openLibraryExport(); })}
         <div class="flex-1"></div>
         {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"))}
     </nav>
 
     {#if autoCullVisited && hasLibrary}
         <div class="min-w-0 flex-1 overflow-y-auto bg-background" hidden={effectiveRail !== "autocull"} inert={effectiveRail !== "autocull"}>
-            <AutoCullView photos={$displayPhotos} allPhotos={$photos} active={effectiveRail === "autocull"} onOpenPreview={openScopedPreview} />
+            <AutoCullView photos={$displayPhotos} allPhotos={$photos} active={effectiveRail === "autocull"} onOpenPreview={openScopedPreview} onExportKeepers={exportKeepers} />
         </div>
     {/if}
 
@@ -583,9 +624,7 @@
             onResetGridPreferences={resetGridPreferences}
         />
     {:else if effectiveRail === "export"}
-        <div class="min-w-0 flex-1 overflow-y-auto bg-background">
-            <ExportPanel photos={$displayPhotos} allPhotos={$photos} />
-        </div>
+        {@render exportScreen()}
     {:else if effectiveRail === "library"}
     <Sidebar
         photos={$displayPhotos}
