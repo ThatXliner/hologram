@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { Archive, Check, Download, Loader2, Upload, XCircle } from "@lucide/svelte";
+    import { Archive, Check, Download, FolderOpen, Loader2, Upload, XCircle } from "@lucide/svelte";
     import { HologramAPI } from "../api.ts";
     import { photoStore } from "../stores/photoStore.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
@@ -8,12 +8,17 @@
     interface Props {
         photos: Photo[];
         allPhotos: Photo[];
+        keepers?: boolean;
+        defaultDestination?: string;
     }
 
-    let { photos, allPhotos }: Props = $props();
+    let { photos, allPhotos, keepers = false, defaultDestination = "" }: Props = $props();
 
     let mode = $state<ExportOptions["mode"]>("folder");
-    let pairMode = $state<ExportOptions["pair_mode"]>("visible");
+    let pairMode = $state<ExportOptions["pair_mode"]>(keepers ? "both" : "visible");
+    let destinationPath = $state(defaultDestination);
+    let isChoosing = $state(false);
+    let openError = $state("");
     let organizeBy = $state<ExportOptions["organize_by"]>("flat");
     let includeMetadata = $state(true);
     let renamePattern = $state("");
@@ -49,15 +54,30 @@
             : "rounded-[5px] px-2 py-[6px] text-left text-[12px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground";
     }
 
-    async function exportVisible() {
-        const destination = await HologramAPI.selectExportFolder();
-        if (!destination) return;
+    async function chooseDestination() {
+        if (isChoosing || isExporting) return;
+        isChoosing = true;
+        try {
+            const selected = await HologramAPI.selectExportFolder();
+            if (selected) destinationPath = selected;
+        } catch (err) {
+            error = String(err);
+        } finally {
+            isChoosing = false;
+        }
+    }
 
+    async function exportVisible() {
+        if (isExporting || isChoosing || photos.length === 0) return;
+        if (!destinationPath.trim()) await chooseDestination();
+        const destination = destinationPath.trim();
+        if (!destination) return;
         isExporting = true;
         result = null;
         error = null;
+        openError = "";
         try {
-            result = await HologramAPI.exportPhotos(photos, allPhotos, {
+            result = await HologramAPI.exportPhotos(photos, keepers ? allPhotos.filter((photo) => photo.flag !== "reject") : allPhotos, {
                 destination_path: destination,
                 mode,
                 pair_mode: pairMode,
@@ -69,6 +89,15 @@
             error = String(err);
         } finally {
             isExporting = false;
+        }
+    }
+
+    async function openOutput() {
+        if (!result) return;
+        try {
+            await HologramAPI.openInEditor(result.output_path);
+        } catch (err) {
+            openError = String(err);
         }
     }
 
@@ -105,8 +134,32 @@
 {/snippet}
 
 <section class="flex h-full min-h-0 bg-background">
-    <!-- CONFIG DECK -->
     <aside class="flex w-[248px] shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card p-[16px_14px]">
+        <section>
+            <label for="export-destination" class="mb-2 block text-[12px] font-medium text-foreground">Destination folder</label>
+            <input id="export-destination" class={selectClass} bind:value={destinationPath} placeholder="Choose a folder" disabled={isExporting || isChoosing} />
+            <button class="mt-2 inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2 text-[12px] text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-40" onclick={chooseDestination} disabled={isChoosing || isExporting}>
+                <FolderOpen size={13} />{isChoosing ? "Choosing…" : "Choose folder"}
+            </button>
+            <p class="mt-2 text-[11px] leading-relaxed text-muted-foreground">Creates the folder if needed. Copies originals; source files stay in place.</p>
+            <div class="mt-3">
+                <button
+                    class="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={isExporting || isChoosing || photos.length === 0}
+                    onclick={exportVisible}
+                >
+                    {#if isExporting}
+                        <Loader2 size={15} class="animate-spin" /> Exporting…
+                    {:else if keepers && mode === "folder"}
+                        <Download size={15} />{destinationPath.replace(/[\\/]$/, "").split(/[\\/]/).at(-1) === "culled" ? "Copy to culled" : `Copy ${photos.length} keepers`}
+                    {:else if mode === "zip"}
+                        <Archive size={15} /> Export {photos.length}
+                    {:else}
+                        <Download size={15} /> Export {photos.length}
+                    {/if}
+                </button>
+            </div>
+        </section>
         <section>
             {@render deckLabel("Export as")}
             <div class="flex flex-col gap-[2px]">
@@ -145,26 +198,28 @@
                 <input type="checkbox" bind:checked={includeMetadata} class="accent-primary" />
                 Write metadata sidecar
             </label>
-            <div class="mt-2 grid grid-cols-2 gap-2">
-                <button
-                    class="flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-2 font-sans text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
-                    disabled={xmpBusy !== null || allPhotos.length === 0}
-                    onclick={exportOriginalXmp}
-                    title="Write XMP sidecars beside originals"
-                >
-                    {#if xmpBusy === "export"}<Loader2 size={12} class="animate-spin" />{:else}<Download size={12} />{/if}
-                    XMP out
-                </button>
-                <button
-                    class="flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-2 font-sans text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
-                    disabled={xmpBusy !== null || allPhotos.length === 0}
-                    onclick={importOriginalXmp}
-                    title="Read XMP sidecars beside originals"
-                >
-                    {#if xmpBusy === "import"}<Loader2 size={12} class="animate-spin" />{:else}<Upload size={12} />{/if}
-                    XMP in
-                </button>
-            </div>
+            {#if !keepers}
+                <div class="mt-2 grid grid-cols-2 gap-2">
+                    <button
+                        class="flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-2 font-sans text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+                        disabled={xmpBusy !== null || allPhotos.length === 0}
+                        onclick={exportOriginalXmp}
+                        title="Write XMP sidecars beside originals"
+                    >
+                        {#if xmpBusy === "export"}<Loader2 size={12} class="animate-spin" />{:else}<Download size={12} />{/if}
+                        XMP out
+                    </button>
+                    <button
+                        class="flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-2 font-sans text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+                        disabled={xmpBusy !== null || allPhotos.length === 0}
+                        onclick={importOriginalXmp}
+                        title="Read XMP sidecars beside originals"
+                    >
+                        {#if xmpBusy === "import"}<Loader2 size={12} class="animate-spin" />{:else}<Upload size={12} />{/if}
+                        XMP in
+                    </button>
+                </div>
+            {/if}
             {#if xmpResult}
                 <div class="mt-2 font-mono text-[10px] text-pick">✓ {xmpResult.processed_count} sidecars{#if xmpResult.skipped_count > 0} · {xmpResult.skipped_count} skipped{/if}</div>
             {:else if xmpError}
@@ -172,26 +227,15 @@
             {/if}
         </section>
 
-        <button
-            class="mt-auto flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={isExporting || photos.length === 0}
-            onclick={exportVisible}
-        >
-            {#if isExporting}
-                <Loader2 size={15} class="animate-spin" /> Exporting…
-            {:else if mode === "zip"}
-                <Archive size={15} /> Export {photos.length}
-            {:else}
-                <Download size={15} /> Export {photos.length}
-            {/if}
-        </button>
+
     </aside>
 
     <!-- MAIN -->
     <div class="flex min-w-0 flex-1 flex-col">
-        <div class="flex h-11 shrink-0 items-center gap-3 border-b border-border px-3.5">
-            <span class="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-subtle">Export set</span>
-            <span class="font-mono text-[11px] text-muted-foreground">{photos.length} visible photos · {mode}</span>
+        <div class="flex shrink-0 flex-col gap-1 border-b border-border px-3.5 py-3">
+            <h2 class="text-[14px] font-semibold text-foreground">{keepers ? "Export keepers" : "Export set"}</h2>
+            <p class="text-[12px] text-muted-foreground">{photos.length} {keepers ? "kept" : "visible"} photos · {mode}{pairMode === "both" ? " · Includes RAW + JPEG pairs" : ""}</p>
+            {#if keepers}<p class="text-[11px] text-muted-foreground">Only photos marked Keep in this AutoCull set are included. Unmarked photos and rejects stay out.</p>{/if}
         </div>
 
         {#if result}
@@ -199,11 +243,15 @@
                 <div class="w-full max-w-md rounded-lg border border-pick/30 bg-card p-6 text-center">
                     <div class="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-full bg-pick/15 text-pick"><Check size={24} /></div>
                     <div class="text-lg font-semibold text-foreground">{result.exported_count} exported</div>
-                    <div class="mt-1 truncate font-mono text-[11px] text-muted-foreground">{result.output_path}</div>
+                    <div class="mt-1 break-all font-mono text-[11px] text-muted-foreground">{result.output_path}</div>
                     {#if result.skipped_count > 0}
                         <div class="mt-2 font-mono text-[11px] text-maybe">{result.skipped_count} skipped</div>
                     {/if}
-                    <button class="mt-4 rounded-md border border-border px-3 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground" onclick={() => (result = null)}>Export again</button>
+                    <div class="mt-4 flex flex-wrap justify-center gap-2">
+                        <button class="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[12px] font-medium text-primary-foreground hover:opacity-90" onclick={openOutput}><FolderOpen size={14} />Open {mode === "zip" ? "archive" : "folder"}</button>
+                        <button class="rounded-md border border-border px-3 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground" onclick={() => (result = null)}>Export again</button>
+                    </div>
+                    {#if openError}<p class="mt-2 break-all text-[12px] text-reject" role="alert">{openError}</p>{/if}
                 </div>
             </div>
         {:else if error}
@@ -219,7 +267,7 @@
             <div class="grid flex-1 place-items-center px-8 text-center">
                 <div class="max-w-sm">
                     <div class="font-mono text-[11px] font-semibold uppercase tracking-[0.1em] text-subtle">Nothing to export</div>
-                    <p class="mt-2 text-[13px] text-muted-foreground">Adjust filters in the library to build the set you want to export.</p>
+                    <p class="mt-2 text-[13px] text-muted-foreground">{keepers ? "Return to AutoCull and mark the photos you want to keep." : "Adjust filters in the library to build the set you want to export."}</p>
                 </div>
             </div>
         {:else}

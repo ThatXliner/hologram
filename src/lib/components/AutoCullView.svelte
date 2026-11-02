@@ -1,6 +1,7 @@
 <script lang="ts">
     import {
         Check,
+        Download,
         ChevronLeft,
         Circle,
         CircleCheck,
@@ -95,6 +96,8 @@
     interface Props {
         photos: Photo[];
         allPhotos: Photo[];
+        onExportKeepers: (photoIds: string[]) => void;
+        active?: boolean;
         onOpenPreview: (
             photoIds: string[],
             selectedPhotoId: string,
@@ -104,7 +107,8 @@
         ) => void;
     }
 
-    let { photos, allPhotos, onOpenPreview }: Props = $props();
+    let { photos, allPhotos, onOpenPreview, onExportKeepers, active = true }: Props = $props();
+    const keeperIds = $derived(photos.filter((photo) => photo.flag === "pick").map((photo) => photo.id));
 
     type Mode = "overview" | "review";
     const AUTO_LABEL = "AutoCull";
@@ -854,6 +858,7 @@
     }
 
     function handleKeydown(event: KeyboardEvent) {
+        if (!active) return;
         if (event.defaultPrevented || isTypingTarget(event.target) || $viewMode === "viewer") return;
         const mod = event.metaKey || event.ctrlKey;
         if (mod && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "z") {
@@ -1018,6 +1023,25 @@
     </div>
 {/snippet}
 
+{#snippet exportKeepersButton(primary: boolean)}
+    <button
+        class="inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-40 {primary ? 'bg-primary text-primary-foreground hover:opacity-90' : 'border border-border text-muted-foreground hover:bg-secondary hover:text-foreground'}"
+        onclick={() => onExportKeepers(keeperIds)}
+        disabled={keeperIds.length === 0 || isAnalyzing}
+        data-autocull-export
+    ><Download size={14} />Export keepers · {keeperIds.length}</button>
+{/snippet}
+
+{#snippet finishExport()}
+    <div class="border-t border-border pt-4" data-autocull-finish>
+        <h3 class="text-[14px] font-semibold text-foreground">Save your keepers</h3>
+        <p class="mt-1 text-[12px] leading-relaxed text-muted-foreground">{keeperIds.length} kept photos, including your manual choices. Copy originals and RAW + JPEG pairs to a folder.</p>
+        <p class="mt-1 break-all text-[11px] text-muted-foreground">{folderPath ? `${folderPath.replace(/[\\/]$/, "")}/culled` : "Choose a destination folder on the next screen."}</p>
+        <div class="mt-3">{@render exportKeepersButton(true)}</div>
+        <p class="mt-2 text-[11px] text-muted-foreground">Review the destination before copying. Source files stay in place.</p>
+    </div>
+{/snippet}
+
 {#snippet overviewScreen()}
     {@const o = overview}
     {@const decidedByAuto = o.keepIds.length + o.rejectIds.length}
@@ -1100,6 +1124,8 @@
                 {/if}
                 {#if isAnalyzing}<span class="flex items-center gap-1.5 font-mono text-[10.5px] text-info"><Loader2 size={12} class="animate-spin" />Updating analysis</span>{/if}
             </div>
+
+            {#if o.applied}{@render finishExport()}{/if}
 
             <p class="min-h-[15px] font-mono text-[10.5px] text-muted-foreground" role="status" aria-live="polite" data-autocull-status>{status}</p>
 
@@ -1286,6 +1312,7 @@
             <span class="flex items-center gap-1.5 font-mono text-[10.5px] text-info"><Loader2 size={12} class="animate-spin" />{progress.current}/{progress.total}</span>
         {/if}
         <div class="flex items-center gap-1.5">
+            {@render exportKeepersButton(false)}
             <button
                 class="inline-flex h-7 items-center gap-1.5 rounded-md border border-border px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:opacity-40"
                 onmousedown={keepFocus}
@@ -1397,8 +1424,9 @@
                                 {reviewProgress.kept} kept · {reviewProgress.rejected} rejected · {reviewProgress.photos - reviewProgress.decidedPhotos} left unflagged
                                 {#if autoKeptIds.length + autoRejectedIds.length}<br />{plural(autoKeptIds.length + autoRejectedIds.length, "flag")} set by AutoCull{/if}
                             </p>
+                            <div class="mt-4">{@render finishExport()}</div>
                             <div class="mt-4 flex flex-wrap justify-center gap-2">
-                                <button class="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-semibold text-primary-foreground hover:opacity-90" onclick={() => { filter = "all"; justCompleted = false; }}>Review all stacks</button>
+                                <button class="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground" onclick={() => { filter = "all"; justCompleted = false; }}>Review all stacks</button>
                                 <button class="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground" onclick={showOverview}>Summary</button>
                                 <button class="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-40" onclick={refreshAnalysis} disabled={isAnalyzing}><RefreshCw size={13} />Refresh analysis</button>
                             </div>

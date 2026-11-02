@@ -48,6 +48,7 @@
     type GridDetails = "image" | "essentials" | "metadata";
     type LibraryView = "grid" | "timeline";
     type RailView = "library" | "autocull" | "export" | "settings";
+    type ExportContext = { kind: "library" } | { kind: "autocull"; folderPath: string | null; photoIds: string[] };
     const GRID_PREFERENCES_KEY = "hologram.gridPreferences";
     const GRID_ZOOM_STEPS = [120, 150, 180, 220, 270, 340, 430, 520] as const;
     const DEFAULT_GRID_ZOOM_LEVEL = 3;
@@ -61,6 +62,7 @@
     let gridDetailMode = $state<GridDetails>("metadata");
     let libraryView = $state<LibraryView>("grid");
     let railView = $state<RailView>("library");
+    let exportContext = $state<ExportContext>({ kind: "library" });
     let searchInput = $state<HTMLInputElement>();
     let savedSearches = $state<SavedSearch[]>([]);
     let activeSavedSearchId = $state<string | null>(null);
@@ -85,6 +87,25 @@
     let lastReviewState = "";
 
     const hasLibrary = $derived($photos.length > 0);
+    const exportPhotos = $derived.by(() => {
+        if (exportContext.kind === "library") return $displayPhotos;
+        if (exportContext.folderPath !== HologramAPI.getActiveFolderPath()) return [];
+        const ids = new Set(exportContext.photoIds);
+        return $photos.filter((photo) => ids.has(photo.id) && photo.flag === "pick");
+    });
+    const keeperDestination = $derived(exportContext.kind === "autocull" && exportContext.folderPath
+        ? `${exportContext.folderPath.replace(/[\\/]$/, "")}/culled` : "");
+
+    function exportKeepers(photoIds: string[]) {
+        exportContext = { kind: "autocull", folderPath: HologramAPI.getActiveFolderPath(), photoIds };
+        railView = "export";
+    }
+
+    function openLibraryExport() {
+        exportContext = { kind: "library" };
+        railView = "export";
+    }
+
     const cursorPhoto = $derived($displayPhotos[$selectedIndex]);
     const smartCollections = $derived(
         smartCollectionsEnabled ? buildSmartCollections($photos, visualIndex) : [],
@@ -494,6 +515,7 @@
             photoStore.setPhotos(result.photos);
             photoStore.setStats(result.stats);
             folderPath = selectedFolder;
+            exportContext = { kind: "library" };
             searchCache.clear();
             clearAllFilters();
             railView = "library";
@@ -624,12 +646,32 @@
     </button>
 {/snippet}
 
+{#snippet exportScreen()}
+    <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div class="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-3 text-xs text-muted-foreground">
+            {#if exportContext.kind === "autocull"}
+                <button class="ui-control" onclick={() => (railView = "autocull")}>Back to AutoCull</button>
+                <span>Export AutoCull keepers · {exportPhotos.length} kept photos</span>
+            {:else}
+                <button class="ui-control" onclick={() => (railView = "library")}>Back to library</button>
+                <span>{activeFilterChips.length ? "Exporting the filtered library" : "Exporting all photos"} · {exportPhotos.length} photos</span>
+                {#if activeFilterChips.length}<span class="truncate">({activeFilterChips.map((chip) => chip.label).join(" · ")})</span>{/if}
+            {/if}
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto">
+            {#key exportContext}
+                <ExportPanel photos={exportPhotos} allPhotos={$photos} keepers={exportContext.kind === "autocull"} defaultDestination={keeperDestination} />
+            {/key}
+        </div>
+    </div>
+{/snippet}
+
 <div class="flex h-screen overflow-hidden bg-background text-foreground">
     <nav aria-label="Main navigation" class="flex w-[76px] shrink-0 flex-col items-center gap-1 border-r border-border bg-rail py-4">
         <div class="mb-6 mt-1 h-5 w-5 rotate-45 rounded border-2 border-primary" title="Hologram"></div>
         {@render railBtn(LayoutGrid, effectiveRail === "library", "Library", () => (railView = "library"))}
         {@render railBtn(Sparkles, effectiveRail === "autocull", "AutoCull", () => (railView = "autocull"), !hasLibrary)}
-        {@render railBtn(Download, effectiveRail === "export", "Export", () => (railView = "export"), !hasLibrary)}
+        {@render railBtn(Download, effectiveRail === "export", "Export", openLibraryExport, !hasLibrary)}
         <div class="flex-1"></div>
         {@render railBtn(Keyboard, false, "Shortcuts", () => shortcutsDialog?.showModal())}
         {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"))}
@@ -643,19 +685,13 @@
             onSmartCollectionsChange={setSmartCollectionsEnabled}
             onResetGridPreferences={resetGridPreferences}
         />
-    {:else if effectiveRail === "autocull"}
-        <div class="min-w-0 flex-1 overflow-y-auto bg-background">
-            <AutoCullView photos={$displayPhotos} allPhotos={$photos} onOpenPreview={openScopedPreview} />
+    {:else if effectiveRail === "autocull" || (effectiveRail === "export" && exportContext.kind === "autocull")}
+        <div class="min-w-0 flex-1 overflow-y-auto bg-background" hidden={effectiveRail !== "autocull"} inert={effectiveRail !== "autocull"}>
+            <AutoCullView photos={$displayPhotos} allPhotos={$photos} onOpenPreview={openScopedPreview} onExportKeepers={exportKeepers} active={effectiveRail === "autocull"} />
         </div>
+        {#if effectiveRail === "export"}{@render exportScreen()}{/if}
     {:else if effectiveRail === "export"}
-        <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
-            <div class="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-3 text-xs text-muted-foreground">
-                <button class="ui-control" onclick={() => (railView = "library")}>Back to library</button>
-                <span>{activeFilterChips.length ? "Exporting the filtered library" : "Exporting all photos"} · {$displayPhotos.length} photos</span>
-                {#if activeFilterChips.length}<span class="truncate">({activeFilterChips.map((chip) => chip.label).join(" · ")})</span>{/if}
-            </div>
-            <div class="min-h-0 flex-1 overflow-y-auto"><ExportPanel photos={$displayPhotos} allPhotos={$photos} /></div>
-        </div>
+        {@render exportScreen()}
     {:else}
         {#if hasLibrary && showSidebar}
             <button class="sidebar-scrim" aria-label="Close filters" onclick={() => (showSidebar = false)}></button>

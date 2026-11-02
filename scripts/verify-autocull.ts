@@ -427,6 +427,10 @@ try {
   };
   await applyAndCheck();
   await page.screenshot({ path: join(output, "autocull-applied.png") });
+  await page.setViewportSize({ width: 800, height: 600 });
+  await page.screenshot({ path: join(output, "autocull-applied-compact.png") });
+  assert.ok(await view.locator("[data-autocull-finish]").isVisible());
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await press("Control+z");
   await view.locator('[data-autocull-overview-state="preview"]').waitFor();
   assert.deepEqual(await decisions(page, libraryIds), initialDecisions, "One undo reverts the whole automatic pass");
@@ -490,6 +494,13 @@ try {
   assert.match(await view.locator("[data-autocull-complete]").innerText(), new RegExp(`All ${allKeys.length} stacks reviewed`));
   assert.match(await view.locator("[data-autocull-progress]").innerText(), new RegExp(`${allKeys.length}/${allKeys.length} stacks`));
   await page.screenshot({ path: join(output, "autocull-complete.png") });
+  await page.setViewportSize({ width: 800, height: 600 });
+  const finishExport = view.locator("[data-autocull-complete] [data-autocull-export]");
+  assert.equal(await finishExport.isEnabled(), true);
+  const finishBounds = (await finishExport.boundingBox())!;
+  assert.ok(finishBounds.y + finishBounds.height <= 600, "Export keepers stays visible after completing review at 800x600");
+  await page.screenshot({ path: join(output, "autocull-complete-compact.png") });
+  await page.setViewportSize({ width: 1440, height: 1000 });
 
   // The completion screen shows no photo, so decision keys must do nothing there either.
   const completed = await decisions(page, libraryIds);
