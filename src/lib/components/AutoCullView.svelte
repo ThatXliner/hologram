@@ -1,12 +1,12 @@
 <script lang="ts">
     import {
         Check,
-        Download,
         ChevronLeft,
         Circle,
         CircleCheck,
         CircleDot,
         CornerDownLeft,
+        Download,
         ListChecks,
         Loader2,
         Maximize2,
@@ -23,6 +23,8 @@
         XCircle,
     } from "@lucide/svelte";
     import { onDestroy, tick, untrack } from "svelte";
+    import { createDecisionBook, type DecisionBook } from "../autocullDecisionBook.ts";
+    import { saveDecisionBookFile } from "../decisionBookFile.ts";
     import {
         DEFAULT_PREFERENCE_PROFILE_ID,
         buildAutoCullSession,
@@ -39,6 +41,7 @@
     } from "../autocull.ts";
     import {
         automaticPhotoIds,
+        automaticFeedbackPhotoIds,
         buildAutoCullPlan,
         loadAutomaticDecisions,
         saveAutomaticDecisions,
@@ -90,14 +93,15 @@
     } from "../autocullReview.ts";
     import { HologramAPI } from "../api.ts";
     import { photoStore, viewMode } from "../stores/photoStore.ts";
+    import { xmpImportState } from "../xmpImport.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
-    import type { AutoCullLabel, AutoCullSession, Photo, PhotoDecisionHandler, VisualIndexProgress } from "../types.ts";
+    import type { AutoCullLabel, AutoCullLearner, AutoCullSession, Photo, PhotoDecisionHandler, VisualIndexProgress } from "../types.ts";
 
     interface Props {
         photos: Photo[];
         allPhotos: Photo[];
+        active: boolean;
         onExportKeepers: (photoIds: string[]) => void;
-        active?: boolean;
         onOpenPreview: (
             photoIds: string[],
             selectedPhotoId: string,
@@ -107,7 +111,7 @@
         ) => void;
     }
 
-    let { photos, allPhotos, onOpenPreview, onExportKeepers, active = true }: Props = $props();
+    let { photos, allPhotos, active, onOpenPreview, onExportKeepers }: Props = $props();
     const keeperIds = $derived(photos.filter((photo) => photo.flag === "pick").map((photo) => photo.id));
 
     type Mode = "overview" | "review";
@@ -129,17 +133,34 @@
     let activePreferenceProfileId = $state(DEFAULT_PREFERENCE_PROFILE_ID);
     let folderPath = $state<string | null>(null);
     let resolutions = $state.raw<ResolutionMap>({});
-    // Flags AutoCull set itself, per folder and shared by every profile. They never train.
     let automatic = $state.raw<AutomaticDecisions>({});
     let history = $state.raw<ReviewSnapshot[]>([]);
     let decisionsSinceAnalysis = $state(0);
+    let analysisError = $state("");
+    let analysisInterrupted = $state(false);
+    let advancedOpen = $state(false);
+
+    type PreparedDecisionBook = { book: DecisionBook; profileId: string; profileName: string; revision: number };
+    type DecisionBookExport =
+        | { kind: "idle" }
+        | { kind: "preparing" }
+        | { kind: "ready"; prepared: PreparedDecisionBook; error: string }
+        | { kind: "saving"; prepared: PreparedDecisionBook }
+        | { kind: "saved"; filename: string; labels: number; comparisons: number }
+        | { kind: "error"; message: string };
+    let decisionBookExport = $state.raw<DecisionBookExport>({ kind: "idle" });
+    let decisionBookRevision = 0;
 
     // Plain variables: these coordinate async work and must not trigger effects.
     let loadedFolder: string | null | undefined = undefined;
     let lastAnalysisKey = "";
     let analysisRun = 0;
     let destroyed = false;
+    let lastImportRevision = 0;
 
+    const actualLearner = $derived(session?.learner?.engine ?? "builtin");
+    const applyBlocked = $derived(isAnalyzing || Boolean(analysisError) || analysisInterrupted || Boolean($xmpImportState.error) || $xmpImportState.syncing);
+    const learnerName = (learner: AutoCullLearner) => learner === "xgboost-native" ? "XGBoost" : "built-in";
     const wide = $derived(innerWidth >= 1024);
     const photosById = $derived(new Map(photos.map((photo) => [photo.id, photo])));
     // Paired RAW files are hidden from the display list but share every decision.
@@ -259,13 +280,26 @@
         untrack(() => resetForFolder(folder));
     });
 
+    $effect(() => {
+        const { revision, error, syncing } = $xmpImportState;
+        if (revision === lastImportRevision) return;
+        lastImportRevision = revision;
+        untrack(() => {
+            resetForFolder(HologramAPI.getActiveFolderPath());
+            status = error ?? (syncing ? "Loading imported XMP decisions…" : "Imported XMP decisions loaded. Earlier Undo history was cleared.");
+        });
+    });
+
     function resetForFolder(folder: string | null) {
+        invalidateDecisionBook();
         loadedFolder = folder;
         folderPath = folder;
         analysisRun++;
         lastAnalysisKey = "";
         isAnalyzing = false;
         session = null;
+        analysisError = "";
+        analysisInterrupted = false;
         mode = "overview";
         selectedPhotoId = null;
         history = [];
@@ -295,6 +329,7 @@
     }
 
     $effect(() => {
+        if (!active || $xmpImportState.error || $xmpImportState.syncing) return;
         const key = analysisInputKey(photos, activePreferenceProfileId, folderPath);
         if (!key || key === lastAnalysisKey) return;
         const timeout = window.setTimeout(() => void runAnalysis(), 350);
@@ -306,16 +341,9 @@
         analysisRun++;
     });
 
-    /** Forget provenance for flags someone changed outside AutoCull: those are now the photographer's. */
-    function pruneAutomatic(library: Photo[]) {
-        const byId = new Map(library.map((photo) => [photo.id, photo]));
-        const stale = Object.keys(automatic).filter((id) => byId.has(id) && !sameDecision(normalizeDecision(byId.get(id)), automatic[id]));
-        if (stale.length === 0) return;
-        automatic = patchAutomatic(automatic, Object.fromEntries(stale.map((id) => [id, null])));
-        saveAutomaticDecisions(storage(), folderPath, automatic);
-    }
-
     async function runAnalysis() {
+        if ($xmpImportState.error || $xmpImportState.syncing) return;
+        invalidateDecisionBook();
         const input = photos;
         const library = allPhotos;
         const folder = folderPath;
@@ -328,6 +356,8 @@
         const runId = ++analysisRun;
         const isCurrent = () => runId === analysisRun && !destroyed;
         isAnalyzing = true;
+        analysisError = "";
+        analysisInterrupted = false;
         progress = { current: 0, total: input.length };
         try {
             const missingIds = await HologramAPI.findMissingPhotoIds(library);
@@ -347,19 +377,22 @@
                 status = "No photos to analyze";
                 return;
             }
-            pruneAutomatic(library);
+            const refinements = loadPreferenceRefinements(profileId);
+            const preferences = loadPairwisePreferences(profileId);
             const next = await buildAutoCullSession(
                 analysisPhotos,
-                loadPairwisePreferences(profileId),
+                preferences,
                 (nextProgress) => {
                     if (isCurrent()) progress = nextProgress;
                 },
-                loadPreferenceRefinements(profileId),
+                refinements,
                 profileId === DEFAULT_PREFERENCE_PROFILE_ID,
                 folder,
                 // AutoCull's own flags are not the photographer's taste: never learn from them.
-                automaticPhotoIds(library, automatic),
+                automaticFeedbackPhotoIds({ photos: library, refinements, pairs: preferences, automatic }),
                 profileId,
+                "auto",
+                isCurrent,
             );
             if (!isCurrent()) return;
             session = next;
@@ -369,7 +402,11 @@
                 : "";
             status = `${next.stats.indexed}/${next.stats.total} previews analyzed${missingNote}`;
         } catch (error) {
-            if (isCurrent()) status = error instanceof Error ? error.message : String(error);
+            if (isCurrent()) {
+                status = error instanceof Error ? error.message : String(error);
+                analysisError = status;
+                advancedOpen = true;
+            }
         } finally {
             if (runId === analysisRun) isAnalyzing = false;
         }
@@ -380,16 +417,66 @@
         void runAnalysis();
     }
 
+    function invalidatePendingAnalysis() {
+        if (!isAnalyzing) return;
+        analysisRun++;
+        isAnalyzing = false;
+        analysisInterrupted = true;
+    }
+
     function setPreferenceProfile(profileId: string) {
         if (!preferenceProfiles.some((profile) => profile.id === profileId)) return;
         if (profileId === activePreferenceProfileId) return;
         // Invalidate in-flight analysis for the old profile; the input key change schedules a new run.
         analysisRun++;
+        isAnalyzing = false;
+        analysisError = "";
+        analysisInterrupted = true;
         history = [];
+        invalidateDecisionBook();
         activePreferenceProfileId = profileId;
         saveActivePreferenceProfileId(profileId);
         resolutions = loadResolutions(storage(), folderPath, profileId, DEFAULT_PREFERENCE_PROFILE_ID);
         status = `Profile: ${preferenceProfiles.find((profile) => profile.id === profileId)?.name ?? "Default"}`;
+    }
+
+    function invalidateDecisionBook() {
+        decisionBookRevision++;
+        decisionBookExport = { kind: "idle" };
+    }
+
+    async function prepareDecisionBook() {
+        if (isAnalyzing || decisionBookExport.kind === "preparing" || decisionBookExport.kind === "saving") return;
+        const revision = ++decisionBookRevision;
+        const profileId = activePreferenceProfileId;
+        const profileName = preferenceProfiles.find((profile) => profile.id === profileId)?.name ?? "Default";
+        decisionBookExport = { kind: "preparing" };
+        try {
+            const book = await createDecisionBook(profileId, allPhotos);
+            if (revision !== decisionBookRevision || destroyed) return;
+            decisionBookExport = { kind: "ready", prepared: { book, profileId, profileName, revision }, error: "" };
+        } catch (error) {
+            if (revision !== decisionBookRevision || destroyed) return;
+            decisionBookExport = { kind: "error", message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+
+    async function saveDecisionBook() {
+        if (decisionBookExport.kind !== "ready" || isAnalyzing) return;
+        const prepared = decisionBookExport.prepared;
+        const isCurrent = () => prepared.revision === decisionBookRevision && prepared.profileId === activePreferenceProfileId && !destroyed;
+        if (!isCurrent()) return;
+        decisionBookExport = { kind: "saving", prepared };
+        try {
+            const result = await saveDecisionBookFile({ book: prepared.book, isCurrent });
+            if (!isCurrent()) return;
+            decisionBookExport = result.kind === "saved"
+                ? { kind: "saved", filename: result.filename, labels: prepared.book.summary.manual_decisions, comparisons: prepared.book.summary.comparisons }
+                : { kind: "ready", prepared, error: "" };
+        } catch (error) {
+            if (!isCurrent()) return;
+            decisionBookExport = { kind: "ready", prepared, error: error instanceof Error ? error.message : String(error) };
+        }
     }
 
     function createProfile() {
@@ -403,6 +490,12 @@
     // ── Selection and navigation ─────────────────────────────────────────────
 
     $effect(() => {
+        if (active) untrack(() => {
+            if (selectedPhotoId) setSelected(selectedPhotoId, true);
+        });
+    });
+
+    $effect(() => {
         if (!session) return;
         if (selectedPhotoId && stackByPhotoId.has(selectedPhotoId)) return;
         untrack(() => {
@@ -413,14 +506,16 @@
 
     function setSelected(photoId: string | null, reveal = false) {
         selectedPhotoId = photoId;
-        if (!photoId) return;
+        if (!photoId || !active) return;
         const index = photos.findIndex((photo) => photo.id === photoId);
         if (index >= 0) photoStore.setSelectedIndex(index);
         if (reveal) revealSelection(photoId);
     }
 
     function revealSelection(photoId: string) {
+        if (!active) return;
         void tick().then(() => {
+            if (!active || destroyed || selectedPhotoId !== photoId) return;
             const stack = stackByPhotoId.get(photoId);
             for (const selector of [`[data-autocull-photo-id="${CSS.escape(photoId)}"]`, stack ? `[data-stack-key="${CSS.escape(stack.key)}"]` : ""]) {
                 if (selector) root?.querySelector<HTMLElement>(selector)?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -536,6 +631,7 @@
     }
 
     function commit(label: string, changes: DecisionChange[], options: CommitOptions = {}): CommitResult | null {
+        if ($xmpImportState.error || $xmpImportState.syncing) return null;
         const { resolveStack = null, confirmIds = [], automaticPass } = options;
         const folder = folderPath;
         const profileId = activePreferenceProfileId;
@@ -612,6 +708,8 @@
                 return null;
             }
         }
+        invalidatePendingAnalysis();
+        invalidateDecisionBook();
         for (const id of refinementIds) {
             const photo = nextById.get(id);
             const analysis = recommendationsById.get(id) ?? recommendationsById.get(photo?.paired_with ?? "");
@@ -642,9 +740,15 @@
     }
 
     function undo() {
+        if ($xmpImportState.error || $xmpImportState.syncing) return;
         const entry = history.at(-1);
         if (!entry) {
             status = "Nothing to undo";
+            return;
+        }
+        if (entry.decisions.some((change) => !lookupById.has(change.id) || !sameDecision(decisionOf(change.id), change.after))) {
+            history = [];
+            status = "Undo cleared because these photos changed in another view. Your newer decisions are kept.";
             return;
         }
         if (Object.keys(entry.refinements).length || entry.pairwise.added.length || entry.pairwise.removed.length) {
@@ -658,6 +762,8 @@
                 return;
             }
         }
+        invalidatePendingAnalysis();
+        invalidateDecisionBook();
         history = history.slice(0, -1);
         const isActiveFolder = entry.folderPath === folderPath;
         const isActive = isActiveFolder && entry.profileId === activePreferenceProfileId;
@@ -676,7 +782,7 @@
             const base = isActiveFolder ? automatic : loadAutomaticDecisions(storage(), entry.folderPath);
             const restored = patchAutomatic(base, entry.automatic);
             saveAutomaticDecisions(storage(), entry.folderPath, restored);
-            if (isActiveFolder) automatic = restored;
+            automatic = restored;
         }
         if (entry.label !== AUTO_LABEL) decisionsSinceAnalysis = Math.max(0, decisionsSinceAnalysis - 1);
         justCompleted = false;
@@ -823,7 +929,7 @@
     }
 
     function applyAutoCull() {
-        if (!plan || !planReady) return;
+        if (!plan || !planReady || applyBlocked) return;
         const kept = plan.keepIds.length;
         const rejected = plan.rejectIds.length;
         const result = commit(AUTO_LABEL, plan.changes, { automaticPass: { resolveKeys: planResolveKeys } });
@@ -858,8 +964,7 @@
     }
 
     function handleKeydown(event: KeyboardEvent) {
-        if (!active) return;
-        if (event.defaultPrevented || isTypingTarget(event.target) || $viewMode === "viewer") return;
+        if (!active || event.defaultPrevented || isTypingTarget(event.target) || $viewMode === "viewer") return;
         const mod = event.metaKey || event.ctrlKey;
         if (mod && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "z") {
             event.preventDefault();
@@ -1023,6 +1128,35 @@
     </div>
 {/snippet}
 
+{#snippet rankerStatus()}
+    <div class="font-mono text-[10.5px] leading-[1.6] text-muted-foreground" data-autocull-session-learner={session ? actualLearner : "none"}>
+        {#if session}
+            Ranker: {learnerName(actualLearner)}
+            {#if session.learner?.engine === "xgboost-native"}
+                {#if session.learner.training_rows > 0}
+                    <span> · {session.learner.training_rows} training rows · {session.learner.train_ms.toFixed(1)} ms</span>
+                {:else}
+                    <span> · no decisions to learn from yet</span>
+                {/if}
+            {:else if session.learner?.fallback_reason}
+                <span data-autocull-learner-fallback> · {session.learner.fallback_reason}</span>
+            {/if}
+        {/if}
+    </div>
+{/snippet}
+
+{#snippet analysisStatus()}
+    {#if analysisError}
+        <div class="mt-2 rounded-md border border-reject/30 bg-reject/5 p-2 text-[11px]" role="alert" data-autocull-analysis-error>
+            <p>Analysis failed. {analysisError}</p>
+            <p class="mt-1">Suggestions from the previous analysis won't be applied until it succeeds.</p>
+            <button class="mt-2 underline" onclick={refreshAnalysis}>Retry</button>
+        </div>
+    {:else if analysisInterrupted}
+        <p class="mt-1 text-info">Analysis changed. <button class="underline" onclick={refreshAnalysis}>Refresh analysis</button> to update suggestions.</p>
+    {/if}
+{/snippet}
+
 {#snippet exportKeepersButton(primary: boolean)}
     <button
         class="inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-40 {primary ? 'bg-primary text-primary-foreground hover:opacity-90' : 'border border-border text-muted-foreground hover:bg-secondary hover:text-foreground'}"
@@ -1101,7 +1235,12 @@
                     <button
                         class="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-[13px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
                         onclick={applyAutoCull}
-                        disabled={isAnalyzing}
+                        disabled={applyBlocked}
+                        title={isAnalyzing ? "Wait for the analysis to finish."
+                            : $xmpImportState.syncing ? "Wait for the XMP import to finish."
+                            : $xmpImportState.error ? "Fix the XMP import first."
+                            : analysisError ? "The last analysis failed. Retry before applying."
+                            : analysisInterrupted ? "Refresh analysis before applying these suggestions." : undefined}
                         data-autocull-apply
                     ><WandSparkles size={15} />Apply AutoCull</button>
                     <button
@@ -1124,6 +1263,8 @@
                 {/if}
                 {#if isAnalyzing}<span class="flex items-center gap-1.5 font-mono text-[10.5px] text-info"><Loader2 size={12} class="animate-spin" />Updating analysis</span>{/if}
             </div>
+
+            {@render analysisStatus()}
 
             {#if o.applied}{@render finishExport()}{/if}
 
@@ -1210,7 +1351,7 @@
             </section>
         {/if}
 
-        <details class="group border-t border-border pt-3" data-autocull-advanced>
+        <details bind:open={advancedOpen} class="group border-t border-border pt-3" data-autocull-advanced>
             <summary class="cursor-pointer list-none font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-subtle transition-colors hover:text-foreground">
                 <span class="inline-block transition-transform group-open:rotate-90">›</span> Analysis &amp; taste profile
             </summary>
@@ -1240,6 +1381,7 @@
                         {/if}
                     </div>
                 {/if}
+                {@render rankerStatus()}
                 <div>
                     {@render deckLabel("Taste profile · all shoots")}
                     <div class="flex flex-col gap-[2px]">
@@ -1257,13 +1399,66 @@
                         </button>
                     </div>
                     <p class="mt-1.5 px-1 text-[11px] italic leading-[1.5] text-subtle">Profiles are shared across every folder. Your keeps, rejects, ratings and finished stacks teach the active profile across shoots. AutoCull's own flags never do. Review progress stays with this folder and profile.</p>
+                    <div class="mt-3 border-t border-border pt-2" data-autocull-decision-book>
+                        <button
+                            class="flex items-center gap-1.5 px-2 py-[5px] text-left text-[12px] text-subtle transition-colors hover:text-foreground disabled:cursor-wait disabled:opacity-50"
+                            onclick={prepareDecisionBook}
+                            disabled={isAnalyzing || decisionBookExport.kind === "preparing" || decisionBookExport.kind === "saving"}
+                            data-autocull-prepare-decision-book
+                        >
+                            {#if decisionBookExport.kind === "preparing"}<Loader2 size={12} class="animate-spin" />{:else}<Download size={12} />{/if}
+                            {decisionBookExport.kind === "preparing" ? "Reading saved reviews…" : "Export decision book…"}
+                        </button>
+                        <div aria-live="polite" class="px-2 text-[11px] leading-[1.5] text-subtle">
+                            {#if decisionBookExport.kind === "ready" || decisionBookExport.kind === "saving"}
+                                {@const prepared = decisionBookExport.prepared}
+                                {@const summary = prepared.book.summary}
+                                <div class="mt-1 rounded-md border border-border bg-background p-2" data-autocull-decision-book-summary>
+                                    <p class="font-medium text-foreground">{prepared.profileName}</p>
+                                    <p>{summary.manual_decisions} labels · {summary.comparisons} comparisons · {summary.photos} photos</p>
+                                    <p>{summary.shoots} provisional shoots · {summary.datasets} feature datasets</p>
+                                    {#each prepared.book.datasets as dataset}
+                                        <p class="mt-1 break-words font-mono text-[10px]">{dataset.backend} · {dataset.photos.length} snapshots</p>
+                                    {/each}
+                                    {#if summary.omitted_decisions || summary.omitted_comparisons}
+                                        <p class="mt-1 text-warning">{summary.omitted_decisions} labels and {summary.omitted_comparisons} comparisons omitted.</p>
+                                        <p>{summary.unavailable_features} photos with missing or outdated features · {summary.missing_shoot} without a source group.</p>
+                                        {#if summary.automatic_feedback}<p>{summary.automatic_feedback} photos still marked automatic were excluded.</p>{/if}
+                                    {/if}
+                                    <p class="mt-2">No original images or file paths. Derived features may reveal coarse image content. IDs are replaced for this file.</p>
+                                    <p class="mt-1">Shoot groups come from source folders. Check that related frames stay together before using them as independent test splits.</p>
+                                    {#if summary.manual_decisions + summary.comparisons === 0}
+                                        <p class="mt-2 text-muted-foreground">No exportable human reviews yet. Review photos in this profile and retry. Reopen older shoots to restore missing source groups.</p>
+                                    {/if}
+                                    {#if decisionBookExport.kind === "ready" && decisionBookExport.error}
+                                        <p role="alert" class="mt-2 text-reject">Could not save the decision book. {decisionBookExport.error}</p>
+                                    {/if}
+                                    <div class="mt-2 flex items-center gap-2">
+                                        <button
+                                            class="rounded-md bg-secondary px-2 py-1 font-medium text-foreground hover:bg-accent disabled:opacity-50"
+                                            onclick={saveDecisionBook}
+                                            disabled={isAnalyzing || decisionBookExport.kind === "saving" || summary.manual_decisions + summary.comparisons === 0}
+                                            data-autocull-save-decision-book
+                                        >{decisionBookExport.kind === "saving" ? "Saving…" : "Save JSON"}</button>
+                                        <button class="px-1 py-1 hover:text-foreground" onclick={invalidateDecisionBook} disabled={decisionBookExport.kind === "saving"} data-autocull-cancel-decision-book>Cancel</button>
+                                    </div>
+                                </div>
+                            {:else if decisionBookExport.kind === "saved"}
+                                <p class="mt-1 break-words" data-autocull-decision-book-saved>Saved {decisionBookExport.filename} · {decisionBookExport.labels} labels · {decisionBookExport.comparisons} comparisons.</p>
+                            {:else if decisionBookExport.kind === "error"}
+                                <p role="alert" class="mt-1 text-reject">Could not prepare the decision book. {decisionBookExport.message} Retry the export.</p>
+                            {:else if decisionBookExport.kind === "idle"}
+                                <p class="mt-1">Generate a local JSON book from this profile's saved human reviews and feature snapshots.</p>
+                            {/if}
+                        </div>
+                    </div>
                 </div>
             </div>
         </details>
     </div>
 {/snippet}
 
-<section bind:this={root} class="relative flex h-full min-h-0 flex-col bg-background" data-autocull-view data-autocull-mode={session ? mode : "loading"}>
+<section bind:this={root} class="relative flex h-full min-h-0 flex-col bg-background" data-autocull-view data-autocull-mode={session ? mode : "loading"} data-autocull-active-learner={session ? actualLearner : "none"}>
     <!-- HEADER: mode · progress · filters · undo · refresh -->
     <header class="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border bg-card px-3 py-2">
         <div class="flex min-w-0 items-center gap-2.5">
@@ -1353,6 +1548,7 @@
             {:else}
                 <div class="flex flex-col items-center gap-3 text-center">
                     {#if status}<p class="max-w-sm text-[12px] text-muted-foreground">{status}</p>{/if}
+                    {@render analysisStatus()}
                     <button class="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90" onclick={refreshAnalysis}>
                         <Sparkles size={16} /> Analyze {photos.length} photos
                     </button>

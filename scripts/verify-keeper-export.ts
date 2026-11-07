@@ -1,21 +1,48 @@
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
 import { createServer } from "vite";
-import { installTauriMock, resolveChromiumExecutable } from "./screenshots.ts";
 
 const output = join(tmpdir(), "hologram-keeper-export");
 await mkdir(output, { recursive: true });
 const server = await createServer({ server: { host: "127.0.0.1", port: 0, strictPort: false } });
 await server.listen();
-const browser = await chromium.launch({ executablePath: resolveChromiumExecutable(), headless: true });
+const executablePath = [chromium.executablePath(), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"].find(existsSync);
+const browser = await chromium.launch({ executablePath, headless: true });
 try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
-    await installTauriMock(page);
+    const thumbnail = (await readFile(new URL("./fixtures/stock/portrait.jpg", import.meta.url))).toString("base64");
+    await page.addInitScript((thumbnail) => {
+        const photo = { file_size: 100, exif: {}, created_at: "2026-01-01T00:00:00Z", modified_at: "2026-01-01T00:00:00Z", thumbnail };
+        const photos = [
+            { ...photo, id: "photo-1", file_path: "/photos/keeper.NEF", file_name: "keeper.NEF", file_type: "NEF", flag: "pick", paired_with: "photo-2" },
+            { ...photo, id: "photo-2", file_path: "/photos/keeper.JPG", file_name: "keeper.JPG", file_type: "JPEG", flag: "pick", paired_with: "photo-1" },
+            { ...photo, id: "photo-3", file_path: "/photos/manual.JPG", file_name: "manual.JPG", file_type: "JPEG", flag: "pick" },
+            { ...photo, id: "photo-4", file_path: "/photos/reject.JPG", file_name: "reject.JPG", file_type: "JPEG", flag: "reject" },
+        ];
+        const stats = { total_photos: 4, raw_count: 1, jpeg_count: 3, paired_count: 1, total_size: 400, cameras: {}, lenses: {} };
+        Object.assign(window, {
+            __TAURI_INTERNALS__: {
+                invoke: async (command: string, args: { photos?: unknown }) => {
+                    if (command === "scan_folder_fast") return { photos, stats };
+                    if (command === "get_photo_stats") return stats;
+                    if (command === "filter_photos") return args.photos;
+                    if (command === "get_photo_metadata") return {};
+                    if (command === "plugin:event|listen") return 1;
+                    return null;
+                },
+                transformCallback: () => 1,
+                unregisterCallback: () => {},
+                convertFileSrc: (path: string) => path,
+            },
+            __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+        });
+    }, thumbnail);
     await page.addInitScript(() => {
         const state = {
             exports: [] as { photos: { id: string; flag: string }[]; options: { destination_path: string; pair_mode: string; mode: string; organize_by: string } }[],
@@ -102,9 +129,9 @@ try {
     await page.getByRole("button", { name: "Back to AutoCull", exact: true }).click();
     assert.equal(await reviewNode?.evaluate((node) => node.isConnected), true);
     await page.getByRole("button", { name: "Export", exact: true }).click();
-    assert.match(await page.locator("body").innerText(), /Exporting all photos · 12 photos/);
+    assert.match(await page.locator("body").innerText(), /Exporting all photos · 3 photos/);
     assert.equal(await destination.inputValue(), "");
-    await page.getByRole("button", { name: "Export 12", exact: true }).click();
+    await page.getByRole("button", { name: "Export 3", exact: true }).click();
     assert.equal(await page.evaluate(() => (window as any).__exportTest.exports.length), 2);
     await page.getByRole("button", { name: "Back to library", exact: true }).click();
     await page.evaluate(async () => {

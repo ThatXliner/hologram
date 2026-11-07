@@ -1,0 +1,9 @@
+[package]
+name = "hologram-xgboost-eval"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hologram-autocull-ranker = { path = "../../crates/autocull-ranker" }
+serde_json = "1"

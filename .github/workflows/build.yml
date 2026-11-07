@@ -7,14 +7,20 @@ on:
       - "v*"
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild and verify
+        required: false
+        default: ""
+        type: string
 
 jobs:
   build:
     # Only run CI builds on non-tag pushes and PRs
-    if: "!startsWith(github.ref, 'refs/tags/v')"
+    if: "!startsWith(github.ref, 'refs/tags/v') && !(github.event_name == 'workflow_dispatch' && inputs.release_tag != '')"
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-15, windows-latest]
+        os: [ubuntu-24.04, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       ORT_CACHE_DIR: ${{ github.workspace }}/.cache/ort
@@ -33,7 +39,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
 
       - name: Install dependencies for Tauri (ubuntu only)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -65,6 +71,23 @@ jobs:
       - name: Build the app
         run: bun run tauri build --ci --config src-tauri/tauri.ci.conf.json
 
+      - name: Verify decision book file export
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib decision_book::tests --locked
+
+      - name: Verify XMP import and persistence
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib xmp_import::tests --locked
+
+      - name: Verify packaged native learner
+        run: |
+          cargo build --release --manifest-path tools/xgboost-eval/Cargo.toml --locked
+          bun scripts/verify-native-bundle.ts
+
+      - name: Upload native package report
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-package-${{ runner.os }}
+          path: native-package-report.json
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -76,7 +99,7 @@ jobs:
             src-tauri/target/release/bundle/*/*.msi
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     permissions:
       contents: write
     strategy:
@@ -85,7 +108,7 @@ jobs:
         include:
           - platform: "macos-15"
             args: "--target aarch64-apple-darwin"
-          - platform: "ubuntu-latest"
+          - platform: "ubuntu-24.04"
             args: ""
           - platform: "windows-latest"
             args: ""
@@ -100,13 +123,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+
+      - name: Verify release target
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const tag = process.env.RELEASE_TAG;
+          const config = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag) || tag !== `v${config.version}`) {
+            throw new Error('Release tag must match the checked-out app version');
+          }
+          NODE
 
       - name: Install dependencies (Ubuntu only)
-        if: matrix.platform == 'ubuntu-latest'
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-          version: 1.0
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          pkg-config --exists glib-2.0 gtk+-3.0 webkit2gtk-4.1
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -177,9 +215,40 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ inputs.release_tag || github.ref_name }}
           releaseName: "Hologram v__VERSION__"
           releaseBody: "See the assets to download and install this version."
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Verify released native learner
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
+        run: |
+          cargo build --release --manifest-path tools/xgboost-eval/Cargo.toml --locked
+          if [[ "${{ matrix.platform }}" == macos-* ]]; then
+            bun scripts/verify-native-bundle.ts src-tauri/target/aarch64-apple-darwin/release/bundle
+          else
+            bun scripts/verify-native-bundle.ts
+          fi
+
+      - name: Upload release native package report
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-native-package-${{ runner.os }}
+          path: native-package-report.json
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: release
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

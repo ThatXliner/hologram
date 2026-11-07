@@ -1,6 +1,6 @@
 {
   "name": "hologram",
-  "version": "1.1.1",
+  "version": "1.2.3",
   "description": "",
   "type": "module",
   "scripts": {
@@ -15,7 +15,10 @@
     "screenshots": "bun scripts/screenshots.ts",
     "screenshots:no-server": "bun scripts/screenshots.ts --no-server",
     "bump": "bash scripts/bump-version.sh",
-    "check:ui": "node --experimental-strip-types scripts/ui-smoke.ts"
+    "check:ui": "node --experimental-strip-types scripts/ui-smoke.ts",
+    "eval:xgboost": "bun scripts/evaluate-xgboost.ts",
+    "test:autocull-native": "bun scripts/verify-native-autocull.ts",
+    "test:autocull-native-races": "bun scripts/verify-native-autocull-races.ts"
   },
   "license": "MIT",
   "dependencies": {

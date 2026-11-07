@@ -1,6 +1,8 @@
 import type {
   AutoCullCluster,
   AutoCullLabel,
+  AutoCullLearnerPolicy,
+  AutoCullLearnerRun,
   AutoCullPairwisePreference,
   AutoCullPhoto,
   AutoCullSession,
@@ -11,6 +13,7 @@ import type {
 import { invoke } from "@tauri-apps/api/core";
 import { photoPreviewSrc } from "./photoPreview.ts";
 import { heavyMediaConcurrency } from "./concurrency.ts";
+import { nativeLearnerAvailable, nativeRankerRequest, scoreNativeRanker, NATIVE_RANKER_VERSION } from "./autocullNative.ts";
 
 const DINO_MODEL_ID = "onnx-community/dinov2-small";
 const TRANSFORMER_EMBEDDING_BACKEND = "dinov2-small-transformersjs";
@@ -104,14 +107,14 @@ export type AutoCullPreferenceRefinement = {
   embedding?: number[];
 };
 
-type RankedExample = {
+export type RankedExample = {
   vector: number[];
   features: number[];
   signal: number;
   confidence: number;
 };
 
-type PairwiseExample = {
+export type PairwiseExample = {
   winnerFeatures: number[];
   loserFeatures: number[];
   confidence: number;
@@ -170,9 +173,10 @@ export type PreferenceFeatureSnapshot = {
   backend: string;
   rankerFeatures: number[];
   embedding: number[];
+  sourceGroup?: string;
 };
 
-const PREFERENCE_FEATURE_VERSION = `${RANKER_VERSION}:${FEATURE_CACHE_VERSION}`;
+export const PREFERENCE_FEATURE_VERSION = `${RANKER_VERSION}:${FEATURE_CACHE_VERSION}`;
 const preferenceFeatureMemory = new Map<string, PreferenceFeatureSnapshot>();
 let preferenceDb: Promise<IDBDatabase | null> | undefined;
 let preferenceWrites: Promise<boolean> = Promise.resolve(true);
@@ -187,12 +191,14 @@ function isPreferenceFeatureSnapshot(value: unknown): value is PreferenceFeature
     && "photoId" in value && typeof value.photoId === "string"
     && "version" in value && value.version === PREFERENCE_FEATURE_VERSION
     && "backend" in value && typeof value.backend === "string"
+    && (!("sourceGroup" in value) || value.sourceGroup === undefined || typeof value.sourceGroup === "string")
     && "rankerFeatures" in value && isFiniteVector(value.rankerFeatures, 11 + EMBEDDING_RANKER_FEATURES)
     && "embedding" in value && isFiniteVector(value.embedding) && value.embedding.some((item) => item !== 0);
 }
 
-function makePreferenceSnapshot(photoId: string, rankerFeatures: number[], pixels: PixelFeatures): PreferenceFeatureSnapshot {
-  return { photoId, version: PREFERENCE_FEATURE_VERSION, backend: pixels.backend, rankerFeatures, embedding: [...pixels.embedding] };
+async function makePreferenceSnapshot(photo: Photo, rankerFeatures: number[], pixels: PixelFeatures): Promise<PreferenceFeatureSnapshot> {
+  return { photoId: photo.id, version: PREFERENCE_FEATURE_VERSION, backend: pixels.backend, rankerFeatures,
+    embedding: [...pixels.embedding], sourceGroup: await preferenceSourceGroup(photo.file_path) };
 }
 
 async function openPreferenceDb(): Promise<IDBDatabase | null> {
@@ -215,7 +221,8 @@ async function openPreferenceDb(): Promise<IDBDatabase | null> {
 }
 
 async function persistPreferenceSnapshots(snapshots: PreferenceFeatureSnapshot[]): Promise<boolean> {
-  const valid = snapshots.filter(isPreferenceFeatureSnapshot);
+  const valid = snapshots.filter(isPreferenceFeatureSnapshot).map((snapshot) => ({ ...snapshot,
+    sourceGroup: snapshot.sourceGroup ?? preferenceFeatureMemory.get(snapshot.photoId)?.sourceGroup }));
   for (const snapshot of valid) preferenceFeatureMemory.set(snapshot.photoId, snapshot);
   if (!valid.length) return true;
   const db = await openPreferenceDb();
@@ -223,7 +230,17 @@ async function persistPreferenceSnapshots(snapshots: PreferenceFeatureSnapshot[]
   return new Promise((resolve) => {
     try {
       const transaction = db.transaction("features", "readwrite");
-      for (const snapshot of valid) transaction.objectStore("features").put(snapshot);
+      const store = transaction.objectStore("features");
+      for (const snapshot of valid) {
+        const request = store.get(snapshot.photoId);
+        request.onsuccess = () => {
+          const previous: unknown = request.result;
+          const updated = { ...snapshot, sourceGroup: snapshot.sourceGroup
+            ?? (isPreferenceFeatureSnapshot(previous) ? previous.sourceGroup : undefined) };
+          preferenceFeatureMemory.set(updated.photoId, updated);
+          store.put(updated);
+        };
+      }
       transaction.oncomplete = () => resolve(true);
       transaction.onerror = () => resolve(false);
       transaction.onabort = () => resolve(false);
@@ -233,19 +250,32 @@ async function persistPreferenceSnapshots(snapshots: PreferenceFeatureSnapshot[]
   });
 }
 
+export async function preferenceSourceGroup(filePath: string): Promise<string | undefined> {
+  const normalized = filePath.replaceAll("\\", "/");
+  const separator = normalized.lastIndexOf("/");
+  if (separator < 0) return undefined;
+  const folder = normalized.slice(0, separator) || "/";
+  try {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(folder));
+    return `folder-sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  } catch {
+    return undefined;
+  }
+}
+
 export function capturePreferenceFeatures(photos: Photo[], session: Pick<AutoCullSession, "photos">): Promise<boolean> {
   const analysisById = new Map(session.photos.map((analysis) => [analysis.photo_id, analysis]));
-  const snapshots = photos.flatMap((photo) => {
+  const pending = Promise.all(photos.map(async (photo) => {
     const analysis = analysisById.get(photo.id);
     if (!analysis?.embedding?.length) return [];
     const pixels = { embedding: analysis.embedding, technicalScore: analysis.technical_score, backend: analysis.embedding_backend ?? PERCEPTUAL_EMBEDDING_BACKEND };
-    return [makePreferenceSnapshot(photo.id, rankerFeatureVector(photo, pixels, pixels.technicalScore), pixels)];
-  });
-  preferenceWrites = preferenceWrites.then(() => persistPreferenceSnapshots(snapshots));
+    return [await makePreferenceSnapshot(photo, rankerFeatureVector(photo, pixels, pixels.technicalScore), pixels)];
+  }));
+  preferenceWrites = preferenceWrites.then(async () => persistPreferenceSnapshots((await pending).flat()));
   return preferenceWrites;
 }
 
-export async function loadPreferenceFeatureSnapshots(photoIds: string[]): Promise<Map<string, PreferenceFeatureSnapshot>> {
+export async function loadPreferenceFeatureSnapshots(photoIds: string[], sourcePhotos: Photo[] = []): Promise<Map<string, PreferenceFeatureSnapshot>> {
   await preferenceWrites;
   const result = new Map<string, PreferenceFeatureSnapshot>();
   const db = await openPreferenceDb();
@@ -269,6 +299,29 @@ export async function loadPreferenceFeatureSnapshots(photoIds: string[]): Promis
     const snapshot = preferenceFeatureMemory.get(id);
     if (snapshot) result.set(id, snapshot);
   }
+  const backfilled: PreferenceFeatureSnapshot[] = [];
+  for (const photo of sourcePhotos) {
+    const snapshot = result.get(photo.id);
+    if (!snapshot || snapshot.sourceGroup) continue;
+    const sourceGroup = await preferenceSourceGroup(photo.file_path);
+    if (!sourceGroup) continue;
+    const updated = { ...snapshot, sourceGroup };
+    result.set(photo.id, updated);
+    backfilled.push(updated);
+  }
+  if (backfilled.length) {
+    preferenceWrites = preferenceWrites.then(() => {
+      const current = backfilled.map((snapshot) => {
+        const latest = preferenceFeatureMemory.get(snapshot.photoId) ?? snapshot;
+        const updated = { ...latest, sourceGroup: latest.sourceGroup ?? snapshot.sourceGroup };
+        result.set(snapshot.photoId, updated);
+        return updated;
+      });
+      return persistPreferenceSnapshots(current);
+    });
+    await preferenceWrites;
+  }
+
   return result;
 }
 
@@ -586,7 +639,10 @@ export async function buildAutoCullSession(
   folderPath: string | null = null,
   excludedTrainingIds: ReadonlySet<string> = new Set(),
   profileId = DEFAULT_PREFERENCE_PROFILE_ID,
+  learner: AutoCullLearnerPolicy = "auto",
+  isCurrent: () => boolean = () => true,
 ): Promise<AutoCullSession> {
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
   const featuresById = new Map<string, PixelFeatures | null>();
   const total = photos.length;
   const sqlCache = await readSqlFeatureCache(photos, folderPath);
@@ -600,6 +656,7 @@ export async function buildAutoCullSession(
     onProgress({ current: completed, total, current_file: photo.file_name });
   });
   await writeSqlFeatureCache(pendingSqlEntries, folderPath);
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
 
   const metadataExcludedIds = learnFromPhotoMetadata ? metadataTrainingExclusions(profileId) : new Set<string>();
   if (learnFromPhotoMetadata) {
@@ -620,17 +677,52 @@ export async function buildAutoCullSession(
     ...preferences.flatMap((item) => [item.winner_photo_id, item.loser_photo_id]),
   ]);
   const records = buildFeatureRecords(photos, featuresById);
-  const captured = photos.filter((photo) => referencedIds.has(photo.id) && !excludedTrainingIds.has(photo.id)).flatMap((photo) => {
+  const captured = await Promise.all(photos.filter((photo) => referencedIds.has(photo.id) && !excludedTrainingIds.has(photo.id)).map(async (photo) => {
     const pixels = featuresById.get(photo.id);
     const record = records.get(photo.id);
-    return pixels && record ? [makePreferenceSnapshot(photo.id, record.rankerFeatures, pixels)] : [];
-  });
-  await persistPreferenceSnapshots(captured);
+    return pixels && record ? [await makePreferenceSnapshot(photo, record.rankerFeatures, pixels)] : [];
+  }));
+  preferenceWrites = preferenceWrites.then(() => isCurrent() ? persistPreferenceSnapshots(captured.flat()) : false);
   await preferenceWrites;
   const snapshots = await loadPreferenceFeatureSnapshots([...referencedIds]);
-  const session = rankAutoCullPhotos(photos, featuresById, preferences, refinements, learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds);
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
+  const session = learner === "auto"
+    ? await rankAutoCullPhotosAutomatically(photos, featuresById, preferences, refinements, learnFromPhotoMetadata,
+      excludedTrainingIds, snapshots, metadataExcludedIds, scoreNativeRanker, nativeLearnerAvailable(), isCurrent)
+    : await (learner === "xgboost-native" ? rankAutoCullPhotosWithNative : rankAutoCullPhotos)(
+      photos, featuresById, preferences, refinements, learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds);
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
   onProgress({ current: total, total });
   return session;
+}
+
+function prepareAutoCullRanking(
+  photos: Photo[],
+  featuresById: Map<string, PixelFeatures | null>,
+  preferences: AutoCullPairwisePreference[] = [],
+  refinements: AutoCullPreferenceRefinement[] = [],
+  learnFromPhotoMetadata = true,
+  excludedTrainingIds: ReadonlySet<string> = new Set(),
+  snapshots: ReadonlyMap<string, PreferenceFeatureSnapshot> = new Map(),
+  metadataExcludedIds: ReadonlySet<string> = new Set(),
+) {
+  photos = photos.map((photo) => excludedTrainingIds.has(photo.id) ? { ...photo, flag: "none", rating: 0 } : photo);
+  const featureRecordsById = buildFeatureRecords(photos, featuresById);
+  const trainingRecords = new Map(featureRecordsById);
+  const backends = new Set([...featuresById.values()].flatMap((features) => features ? [features.backend] : []));
+  for (const [id, snapshot] of snapshots) {
+    if (!trainingRecords.has(id) && isPreferenceFeatureSnapshot(snapshot) && backends.has(snapshot.backend)) {
+      trainingRecords.set(id, { backend: snapshot.backend, embedding: snapshot.embedding, technicalScore: snapshot.rankerFeatures[0], rankerFeatures: snapshot.rankerFeatures });
+    }
+  }
+  const batches = new Map<string, { examples: RankedExample[]; pairs: PairwiseExample[] }>();
+  for (const backend of backends) {
+    const records = new Map([...trainingRecords].filter(([, record]) => record.backend === backend));
+    const examples = buildRankedExamples(photos.filter((photo) => !excludedTrainingIds.has(photo.id)), records, refinements.filter((item) => !excludedTrainingIds.has(item.photo_id)), learnFromPhotoMetadata, metadataExcludedIds);
+    const pairwiseExamples = buildPairwiseExamples(preferences.filter((item) => !excludedTrainingIds.has(item.winner_photo_id) && !excludedTrainingIds.has(item.loser_photo_id)), records);
+    batches.set(backend, { examples, pairs: pairwiseExamples });
+  }
+  return { photos, featureRecordsById, batches };
 }
 
 // Keep ranking independent of image loading so cached and fresh analysis use the same policy.
@@ -644,22 +736,79 @@ export function rankAutoCullPhotos(
   snapshots: ReadonlyMap<string, PreferenceFeatureSnapshot> = new Map(),
   metadataExcludedIds: ReadonlySet<string> = new Set(),
 ): AutoCullSession {
-  photos = photos.map((photo) => excludedTrainingIds.has(photo.id) ? { ...photo, flag: "none", rating: 0 } : photo);
-  const featureRecordsById = buildFeatureRecords(photos, featuresById);
-  const trainingRecords = new Map(featureRecordsById);
-  const backends = new Set([...featuresById.values()].flatMap((features) => features ? [features.backend] : []));
-  for (const [id, snapshot] of snapshots) {
-    if (!trainingRecords.has(id) && isPreferenceFeatureSnapshot(snapshot) && backends.has(snapshot.backend)) {
-      trainingRecords.set(id, { backend: snapshot.backend, embedding: snapshot.embedding, technicalScore: snapshot.rankerFeatures[0], rankerFeatures: snapshot.rankerFeatures });
+  const prepared = prepareAutoCullRanking(photos, featuresById, preferences, refinements, learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds);
+  const models = new Map([...prepared.batches].map(([backend, batch]) => [backend, { model: trainRankingModel(batch.examples, batch.pairs), count: batch.examples.length + batch.pairs.length }]));
+  return finishAutoCullRanking(prepared, models, { engine: "builtin" });
+}
+
+export async function rankAutoCullPhotosWithNative(
+  photos: Photo[],
+  featuresById: Map<string, PixelFeatures | null>,
+  preferences: AutoCullPairwisePreference[] = [],
+  refinements: AutoCullPreferenceRefinement[] = [],
+  learnFromPhotoMetadata = true,
+  excludedTrainingIds: ReadonlySet<string> = new Set(),
+  snapshots: ReadonlyMap<string, PreferenceFeatureSnapshot> = new Map(),
+  metadataExcludedIds: ReadonlySet<string> = new Set(),
+  score = scoreNativeRanker,
+): Promise<AutoCullSession> {
+  const prepared = prepareAutoCullRanking(photos, featuresById, preferences, refinements, learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds);
+  const models = new Map<string, { model: RankingModel; count: number }>();
+  const learner: AutoCullLearnerRun = { engine: "xgboost-native", version: "3.1.1", training_rows: 0, train_ms: 0, predict_ms: 0 };
+  for (const [backend, batch] of prepared.batches) {
+    const records = [...prepared.featureRecordsById].filter(([, record]) => record.backend === backend);
+    const request = nativeRankerRequest(batch.examples, batch.pairs, records.map(([, record]) => record.rankerFeatures));
+    const response = await score(request);
+    const byFeatures = new Map(records.map(([, record], index) => [record.rankerFeatures, response.scores[index]]));
+    models.set(backend, { count: batch.examples.length + batch.pairs.length, model: {
+      examples: batch.examples,
+      score: (features) => features ? byFeatures.get(features) ?? null : null,
+    } });
+    learner.training_rows += response.training_rows;
+    learner.train_ms += response.train_ms;
+    learner.predict_ms += response.predict_ms;
+  }
+  return finishAutoCullRanking(prepared, models, learner);
+}
+
+export async function rankAutoCullPhotosAutomatically(
+  photos: Photo[],
+  featuresById: Map<string, PixelFeatures | null>,
+  preferences: AutoCullPairwisePreference[] = [],
+  refinements: AutoCullPreferenceRefinement[] = [],
+  learnFromPhotoMetadata = true,
+  excludedTrainingIds: ReadonlySet<string> = new Set(),
+  snapshots: ReadonlyMap<string, PreferenceFeatureSnapshot> = new Map(),
+  metadataExcludedIds: ReadonlySet<string> = new Set(),
+  score = scoreNativeRanker,
+  nativeAvailable = nativeLearnerAvailable(),
+  isCurrent: () => boolean = () => true,
+): Promise<AutoCullSession> {
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
+  let fallbackReason = "Native training is unavailable outside the desktop app.";
+  if (nativeAvailable) {
+    try {
+      const session = await rankAutoCullPhotosWithNative(photos, featuresById, preferences, refinements,
+        learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds, score);
+      if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
+      return session;
+    } catch (error) {
+      fallbackReason = error instanceof Error ? error.message : String(error);
     }
   }
-  const models = new Map<string, { model: RankingModel; count: number }>();
-  for (const backend of backends) {
-    const records = new Map([...trainingRecords].filter(([, record]) => record.backend === backend));
-    const examples = buildRankedExamples(photos.filter((photo) => !excludedTrainingIds.has(photo.id)), records, refinements.filter((item) => !excludedTrainingIds.has(item.photo_id)), learnFromPhotoMetadata, metadataExcludedIds);
-    const pairwiseExamples = buildPairwiseExamples(preferences.filter((item) => !excludedTrainingIds.has(item.winner_photo_id) && !excludedTrainingIds.has(item.loser_photo_id)), records);
-    models.set(backend, { model: trainRankingModel(examples, pairwiseExamples), count: examples.length + pairwiseExamples.length });
-  }
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
+  const session = rankAutoCullPhotos(photos, featuresById, preferences, refinements,
+    learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds);
+  session.learner = { engine: "builtin", fallback_reason: fallbackReason };
+  return session;
+}
+
+function finishAutoCullRanking(
+  prepared: ReturnType<typeof prepareAutoCullRanking>,
+  models: Map<string, { model: RankingModel; count: number }>,
+  learner: AutoCullLearnerRun,
+): AutoCullSession {
+  const { photos, featureRecordsById } = prepared;
   const trainingCount = [...models.values()].reduce((sum, item) => sum + item.count, 0);
 
   let scored = photos.map((photo) => {
@@ -692,7 +841,7 @@ export function rankAutoCullPhotos(
       confidence: recommendationConfidence(photo, finalScore, embedding),
       reasons: recommendationReasons(photo, technicalScore, personalScore - neutral - behaviorSignalValue, Boolean(embedding), count),
       embedding,
-      embedding_backend: record?.embedding ? (featuresById.get(photo.id)?.backend ?? PERCEPTUAL_EMBEDDING_BACKEND) : undefined,
+      embedding_backend: record?.embedding ? record.backend : undefined,
       captureMs: captureTimestampMs(photo),
       sortTimeMs: sortTimestampMs(photo),
       sequence: filenameSequence(photo.file_name),
@@ -718,7 +867,8 @@ export function rankAutoCullPhotos(
   }) => photo);
   return {
     embedding_backend: EMBEDDING_BACKEND,
-    ranker_version: RANKER_VERSION,
+    ranker_version: learner.engine === "xgboost-native" ? NATIVE_RANKER_VERSION : RANKER_VERSION,
+    learner,
     generated_at: new Date().toISOString(),
     photos: outputPhotos,
     clusters,
@@ -1638,7 +1788,7 @@ function buildPairwiseExamples(
   return examples;
 }
 
-function trainRankingModel(examples: RankedExample[], pairwiseExamples: PairwiseExample[]): RankingModel {
+export function trainRankingModel(examples: RankedExample[], pairwiseExamples: PairwiseExample[]): RankingModel {
   const dimensions = examples[0]?.features.length ?? pairwiseExamples[0]?.winnerFeatures.length ?? 0;
   const usableExamples = examples.filter((example) => example.features.length === dimensions);
   const usablePairwiseExamples = pairwiseExamples.filter((example) => (
@@ -2069,7 +2219,7 @@ function behaviorSignal(photo: Photo): number {
   return clamp(signal, -0.3, 0.3);
 }
 
-function pointwiseSignal(flag: CullFlag, rating: number): number {
+export function pointwiseSignal(flag: CullFlag, rating: number): number {
   const ratingSignal = rating > 0 ? rating / 5 : 0.5;
   if (flag === "pick") return clamp01(Math.max(0.78, ratingSignal));
   if (flag === "reject") return clamp01(Math.min(0.18, ratingSignal * 0.35));

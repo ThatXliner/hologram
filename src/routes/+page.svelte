@@ -62,6 +62,7 @@
     let gridDetailMode = $state<GridDetails>("metadata");
     let libraryView = $state<LibraryView>("grid");
     let railView = $state<RailView>("library");
+    let autoCullVisited = $state(false);
     let exportContext = $state<ExportContext>({ kind: "library" });
     let searchInput = $state<HTMLInputElement>();
     let savedSearches = $state<SavedSearch[]>([]);
@@ -138,6 +139,11 @@
         ...(activeSmartCollectionId ? [{ key: "collection", label: smartCollections.find((item) => item.id === activeSmartCollectionId)?.name ?? "Smart collection" }] : []),
     ]);
 
+    $effect(() => {
+        if (!hasLibrary) autoCullVisited = false;
+        else if (effectiveRail === "autocull") autoCullVisited = true;
+    });
+    
     let previewScopeIds = $state<string[] | null>(null);
     let previewStartIndex = $state(0);
     let previewConfirmCluster = $state<(() => void) | null>(null);
@@ -677,6 +683,12 @@
         {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"))}
     </nav>
 
+    {#if autoCullVisited && hasLibrary}
+        <div class="min-w-0 flex-1 overflow-y-auto bg-background" hidden={effectiveRail !== "autocull"} inert={effectiveRail !== "autocull"}>
+            <AutoCullView photos={$displayPhotos} allPhotos={$photos} active={effectiveRail === "autocull"} onOpenPreview={openScopedPreview} onExportKeepers={exportKeepers} />
+        </div>
+    {/if}
+
     {#if effectiveRail === "settings"}
         <SettingsPanel
             {gridZoomLevel} {maxGridZoomLevel} {gridTileSize} {gridDetailMode} {smartCollectionsEnabled}
@@ -685,14 +697,9 @@
             onSmartCollectionsChange={setSmartCollectionsEnabled}
             onResetGridPreferences={resetGridPreferences}
         />
-    {:else if effectiveRail === "autocull" || (effectiveRail === "export" && exportContext.kind === "autocull")}
-        <div class="min-w-0 flex-1 overflow-y-auto bg-background" hidden={effectiveRail !== "autocull"} inert={effectiveRail !== "autocull"}>
-            <AutoCullView photos={$displayPhotos} allPhotos={$photos} onOpenPreview={openScopedPreview} onExportKeepers={exportKeepers} active={effectiveRail === "autocull"} />
-        </div>
-        {#if effectiveRail === "export"}{@render exportScreen()}{/if}
     {:else if effectiveRail === "export"}
         {@render exportScreen()}
-    {:else}
+    {:else if effectiveRail === "library"}
         {#if hasLibrary && showSidebar}
             <button class="sidebar-scrim" aria-label="Close filters" onclick={() => (showSidebar = false)}></button>
             <div class="library-sidebar">
