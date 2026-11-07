@@ -2,6 +2,7 @@
     import { Archive, Check, Download, FolderOpen, Loader2, Upload, XCircle } from "@lucide/svelte";
     import { HologramAPI } from "../api.ts";
     import { photoStore } from "../stores/photoStore.ts";
+    import { ariaKeys, hasCommandModifier, shortcutMod } from "../shortcuts.ts";
     import { beginXmpImport, finishXmpImport, xmpImportState } from "../xmpImport.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
     import type { ExportOptions, ExportResult, Photo, XmpSidecarResult, XmpImportResult } from "../types.ts";
@@ -103,6 +104,14 @@
         }
     }
 
+    function handleKeydown(event: KeyboardEvent) {
+        // Works from the destination and rename fields too: that is where you finish setting up.
+        if (event.defaultPrevented || event.key !== "Enter" || !hasCommandModifier(event) || event.shiftKey || event.altKey) return;
+        if (result || (event.target as HTMLElement | null)?.closest?.("dialog[open]")) return;
+        event.preventDefault();
+        void exportVisible();
+    }
+
     async function openOutput() {
         if (!result) return;
         try {
@@ -149,6 +158,8 @@
     }
 </script>
 
+<svelte:window onkeydown={handleKeydown} />
+
 {#snippet deckLabel(text: string)}
     <div class="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-subtle">{text}</div>
 {/snippet}
@@ -167,6 +178,8 @@
                     class="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
                     disabled={isExporting || isChoosing || photos.length === 0}
                     onclick={exportVisible}
+                    aria-keyshortcuts={ariaKeys(`${shortcutMod}Enter`)}
+                    title="Start the export ({shortcutMod}Enter)"
                 >
                     {#if isExporting}
                         <Loader2 size={15} class="animate-spin" /> Exporting…

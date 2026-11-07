@@ -21,6 +21,7 @@
     import { buildSmartCollections } from "../lib/collections.ts";
     import { indexPhotoVisuals } from "../lib/visualIndex.ts";
     import { photoPreviewSrc } from "../lib/photoPreview.ts";
+    import { altDigit, ariaKeys, hasCommandModifier, isTypingTarget, SHORTCUT_SECTIONS, shortcutAlt, shortcutMod } from "../lib/shortcuts.ts";
     import type { CullFlag, Photo, PhotoDecisionHandler, PhotoFilter, SavedSearch, ThumbnailReady, VisualIndexEntry, VisualIndexProgress } from "../lib/types.ts";
     import {
         Check,
@@ -147,6 +148,7 @@
     let previewScopeIds = $state<string[] | null>(null);
     let previewStartIndex = $state(0);
     let previewConfirmCluster = $state<(() => void) | null>(null);
+    let previewRejectCluster = $state<(() => void) | null>(null);
     let previewPreloadIds = $state<string[]>([]);
     let previewDecision = $state<PhotoDecisionHandler | null>(null);
     const previewPhotos = $derived(
@@ -168,10 +170,12 @@
         onConfirmCluster?: () => void,
         preloadPhotoIds: string[] = [],
         onDecision?: PhotoDecisionHandler,
+        onRejectCluster?: () => void,
     ) {
         previewScopeIds = photoIds;
         previewStartIndex = Math.max(0, photoIds.indexOf(selectedPhotoId));
         previewConfirmCluster = onConfirmCluster ?? null;
+        previewRejectCluster = onRejectCluster ?? null;
         previewPreloadIds = preloadPhotoIds;
         previewDecision = onDecision ?? null;
         photoStore.setViewMode("viewer");
@@ -181,6 +185,7 @@
         if ($viewMode !== "viewer") {
             previewScopeIds = null;
             previewConfirmCluster = null;
+            previewRejectCluster = null;
             previewDecision = null;
             previewPreloadIds = [];
         }
@@ -226,22 +231,91 @@
         }
     }
 
+    const RAIL_SHORTCUTS: Record<string, RailView> = { "1": "library", "2": "autocull", "3": "export", ",": "settings" };
+    const FLAG_FILTER_ORDER: CullFilter[] = ["all", "pick", "reject", "none"];
+
+    function goToRail(next: RailView) {
+        if (next === "export") openLibraryExport();
+        else railView = next;
+    }
+
+    function handleSearchKeydown(event: KeyboardEvent) {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            if (searchTimer) clearTimeout(searchTimer);
+            applyAllFilters();
+            searchInput?.blur();
+        } else if (event.key === "Escape") {
+            // First Esc clears the query, the next one leaves the field.
+            event.preventDefault();
+            if (searchQuery) removeFilterChip("search");
+            else searchInput?.blur();
+        }
+    }
+
     function handleLibraryKeydown(event: KeyboardEvent) {
-        if ($viewMode === "viewer" || event.metaKey || event.ctrlKey || event.altKey) return;
+        if ($viewMode === "viewer" || event.defaultPrevented) return;
         const target = event.target as HTMLElement;
-        if (event.key === "Escape" && !target.closest("dialog")) {
+        const inLibrary = effectiveRail === "library" && hasLibrary;
+
+        if (hasCommandModifier(event) && !event.shiftKey && !event.altKey) {
+            if (target.closest("dialog[open]")) return;
+            const key = event.key.toLowerCase();
+            const rail = RAIL_SHORTCUTS[key];
+            let action: (() => void) | undefined;
+            if (rail) action = () => { if (hasLibrary || rail === "library" || rail === "settings") goToRail(rail); };
+            else if (key === "o") action = importFolder;
+            else if (inLibrary && key === "f") action = () => searchInput?.focus();
+            else if (inLibrary && key === "e") action = openLibraryExport;
+            else if (inLibrary && key === "s") action = () => { if (activeFilterChips.length) openSaveSearch(); };
+            if (!action) return;
+            event.preventDefault();
+            action();
+            return;
+        }
+
+        if (event.key === "Escape" && !target.closest("dialog[open]")) {
             if (viewOptions?.open) viewOptions.open = false;
             else if (window.innerWidth < 1100) showSidebar = false;
             return;
         }
-        if (target.closest("input, textarea, select, dialog, [contenteditable=true]")) return;
-        if (event.key === "/" && effectiveRail === "library" && hasLibrary) {
+        if (isTypingTarget(target) || target.closest("dialog[open]")) return;
+
+        const filterNumber = altDigit(event);
+        if (filterNumber !== null) {
+            const next = FLAG_FILTER_ORDER[filterNumber - 1];
+            if (!inLibrary || !next) return;
             event.preventDefault();
-            searchInput?.focus();
-        } else if (event.key === "?") {
+            setCullFilter(next);
+            return;
+        }
+        if (event.altKey || hasCommandModifier(event)) return;
+
+        if (event.key === "?") {
             event.preventDefault();
             shortcutsDialog?.showModal();
+            return;
         }
+        if (!inLibrary || event.shiftKey && event.key !== "+") return;
+        const actions: Record<string, () => void> = {
+            "/": () => searchInput?.focus(),
+            f: () => (showSidebar = !showSidebar),
+            g: () => (libraryView = "grid"),
+            t: () => (libraryView = "timeline"),
+            h: () => { if (cullFilter !== "reject") toggleHideRejects(); },
+            "+": () => adjustGridZoom(1),
+            "=": () => adjustGridZoom(1),
+            "-": () => adjustGridZoom(-1),
+        };
+        const action = actions[event.key.toLowerCase()];
+        if (!action) return;
+        event.preventDefault();
+        action();
+    }
+
+    function openSaveSearch() {
+        savedSearchName = activeSavedSearchId ? savedSearches.find((item) => item.id === activeSavedSearchId)?.name ?? "" : searchQuery;
+        saveSearchDialog?.showModal();
     }
 
     onMount(() => {
@@ -638,13 +712,14 @@
 
 <svelte:window onkeydown={handleLibraryKeydown} onpointerdown={(event) => { if (viewOptions?.open && !viewOptions.contains(event.target as Node)) viewOptions.open = false; }} />
 
-{#snippet railBtn(Icon: any, active: boolean, label: string, onclick: () => void, disabled = false)}
+{#snippet railBtn(Icon: any, active: boolean, label: string, onclick: () => void, disabled = false, shortcut = "")}
     <button
         class="relative flex h-[60px] w-16 flex-col items-center justify-center gap-1.5 rounded-lg text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-35 {active ? 'bg-secondary text-primary' : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground'}"
         {onclick}
         {disabled}
-        title={disabled ? `Open a photo folder to use ${label}` : label}
+        title={disabled ? `Open a photo folder to use ${label}` : shortcut ? `${label} (${shortcut})` : label}
         aria-label={label}
+        aria-keyshortcuts={shortcut ? ariaKeys(shortcut) : undefined}
         aria-pressed={active}
     >
         <Icon size={19} />
@@ -675,12 +750,12 @@
 <div class="flex h-screen overflow-hidden bg-background text-foreground">
     <nav aria-label="Main navigation" class="flex w-[76px] shrink-0 flex-col items-center gap-1 border-r border-border bg-rail py-4">
         <div class="mb-6 mt-1 h-5 w-5 rotate-45 rounded border-2 border-primary" title="Hologram"></div>
-        {@render railBtn(LayoutGrid, effectiveRail === "library", "Library", () => (railView = "library"))}
-        {@render railBtn(Sparkles, effectiveRail === "autocull", "AutoCull", () => (railView = "autocull"), !hasLibrary)}
-        {@render railBtn(Download, effectiveRail === "export", "Export", openLibraryExport, !hasLibrary)}
+        {@render railBtn(LayoutGrid, effectiveRail === "library", "Library", () => (railView = "library"), false, `${shortcutMod}1`)}
+        {@render railBtn(Sparkles, effectiveRail === "autocull", "AutoCull", () => (railView = "autocull"), !hasLibrary, `${shortcutMod}2`)}
+        {@render railBtn(Download, effectiveRail === "export", "Export", openLibraryExport, !hasLibrary, `${shortcutMod}3`)}
         <div class="flex-1"></div>
-        {@render railBtn(Keyboard, false, "Shortcuts", () => shortcutsDialog?.showModal())}
-        {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"))}
+        {@render railBtn(Keyboard, false, "Shortcuts", () => shortcutsDialog?.showModal(), false, "?")}
+        {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"), false, `${shortcutMod},`)}
     </nav>
 
     {#if autoCullVisited && hasLibrary}
@@ -743,13 +818,13 @@
                 </section>
             {:else}
                 <header class="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-3">
-                    <button class="ui-control" onclick={() => (showSidebar = !showSidebar)} aria-expanded={showSidebar} aria-controls="library-filters" title="Show or hide library filters"><PanelLeft size={16} /> Filters</button>
+                    <button class="ui-control" onclick={() => (showSidebar = !showSidebar)} aria-expanded={showSidebar} aria-controls="library-filters" aria-keyshortcuts="F" title="Show or hide library filters (F)"><PanelLeft size={16} /> Filters</button>
                     <div class="min-w-0 flex-1">
                         <h1 class="truncate text-sm font-semibold" title={folderPath}>{folderName}</h1>
                         <p class="text-xs text-muted-foreground" aria-live="polite">{$displayPhotos.length} of {$libraryPhotos.length} photos{#if activeFilterChips.length} · Filtered{/if}</p>
                     </div>
-                    <button class="ui-control" onclick={importFolder} disabled={$isLoading} aria-label="Open folder" title="Open another photo folder"><FolderOpen size={15} /><span class="hidden min-[950px]:inline">Open folder</span></button>
-                    <button class="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-40" onclick={openSelectedPhoto} disabled={!cursorPhoto || $isLoading}>
+                    <button class="ui-control" onclick={importFolder} disabled={$isLoading} aria-label="Open folder" aria-keyshortcuts={ariaKeys(`${shortcutMod}O`)} title="Open another photo folder ({shortcutMod}O)"><FolderOpen size={15} /><span class="hidden min-[950px]:inline">Open folder</span></button>
+                    <button class="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-40" onclick={openSelectedPhoto} disabled={!cursorPhoto || $isLoading} aria-keyshortcuts="Space Enter" title="Open the selected photo (Space)">
                         Review photo <ArrowRight size={14} />
                     </button>
                 </header>
@@ -764,36 +839,36 @@
                 <div class="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-4 py-3">
                     <div class="relative min-w-[180px] flex-1">
                         <Search size={15} class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                        <input bind:this={searchInput} type="text" aria-label="Search photos" placeholder="Search photos, cameras, tags…" class="h-9 w-full rounded-md border border-input bg-popover pl-9 pr-9 text-xs outline-none placeholder:text-muted-foreground focus:border-primary" bind:value={searchQuery} oninput={handleSearchInput} />
+                        <input bind:this={searchInput} type="text" aria-label="Search photos" placeholder="Search photos, cameras, tags…" class="h-9 w-full rounded-md border border-input bg-popover pl-9 pr-9 text-xs outline-none placeholder:text-muted-foreground focus:border-primary" bind:value={searchQuery} oninput={handleSearchInput} onkeydown={handleSearchKeydown} aria-keyshortcuts="/ Control+F Meta+F" />
                         {#if searchQuery}<button class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" aria-label="Clear search" onclick={() => removeFilterChip("search")}><X size={14} /></button>
                         {:else}<kbd class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-muted-foreground">/</kbd>{/if}
                     </div>
                     <div class="inline-flex h-9 shrink-0 items-center rounded-md border border-border p-0.5" aria-label="Library view">
-                        <button class="view-button {libraryView === 'grid' ? 'bg-secondary text-foreground' : 'text-muted-foreground'}" aria-pressed={libraryView === "grid"} onclick={() => (libraryView = "grid")}><LayoutGrid size={14} /> Grid</button>
-                        <button class="view-button {libraryView === 'timeline' ? 'bg-secondary text-foreground' : 'text-muted-foreground'}" aria-pressed={libraryView === "timeline"} onclick={() => (libraryView = "timeline")}>Timeline</button>
+                        <button class="view-button {libraryView === 'grid' ? 'bg-secondary text-foreground' : 'text-muted-foreground'}" aria-pressed={libraryView === "grid"} aria-keyshortcuts="G" title="Grid (G)" onclick={() => (libraryView = "grid")}><LayoutGrid size={14} /> Grid</button>
+                        <button class="view-button {libraryView === 'timeline' ? 'bg-secondary text-foreground' : 'text-muted-foreground'}" aria-pressed={libraryView === "timeline"} aria-keyshortcuts="T" title="Timeline (T)" onclick={() => (libraryView = "timeline")}>Timeline</button>
                     </div>
                     <details bind:this={viewOptions} class="relative">
                         <summary class="ui-control list-none"><SlidersHorizontal size={15} /> View options</summary>
                         <div class="absolute right-0 z-30 mt-2 w-64 space-y-4 rounded-lg border border-input bg-popover p-4 shadow-xl">
                             <label class="block text-xs font-medium" for="thumbnail-size">Thumbnail size</label>
                             <div class="flex items-center gap-2">
-                                <button class="text-muted-foreground disabled:opacity-30" onclick={() => adjustGridZoom(-1)} disabled={gridZoomLevel === 0} aria-label="Smaller thumbnails"><Minus size={16} /></button>
+                                <button class="text-muted-foreground disabled:opacity-30" onclick={() => adjustGridZoom(-1)} disabled={gridZoomLevel === 0} aria-label="Smaller thumbnails" aria-keyshortcuts="-" title="Smaller thumbnails (−)"><Minus size={16} /></button>
                                 <input id="thumbnail-size" class="grid-zoom-slider h-6 min-w-0 flex-1" type="range" min="0" max={maxGridZoomLevel} step="1" value={gridZoomLevel} oninput={(event) => setGridZoomLevel(Number(event.currentTarget.value))} />
-                                <button class="text-muted-foreground disabled:opacity-30" onclick={() => adjustGridZoom(1)} disabled={gridZoomLevel === maxGridZoomLevel} aria-label="Larger thumbnails"><Plus size={16} /></button>
+                                <button class="text-muted-foreground disabled:opacity-30" onclick={() => adjustGridZoom(1)} disabled={gridZoomLevel === maxGridZoomLevel} aria-label="Larger thumbnails" aria-keyshortcuts="+" title="Larger thumbnails (+)"><Plus size={16} /></button>
                             </div>
                             <label class="block text-xs font-medium" for="grid-details">Photo details</label>
                             <select id="grid-details" class="ui-select w-full" bind:value={gridDetailMode} disabled={libraryView !== "grid"}>
                                 <option value="image">Images only</option><option value="essentials">Filename and rating</option><option value="metadata">Full metadata</option>
                             </select>
-                            <label class="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={hideRejects} disabled={cullFilter === "reject"} onchange={toggleHideRejects} /> Hide rejected photos</label>
+                            <label class="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={hideRejects} disabled={cullFilter === "reject"} onchange={toggleHideRejects} aria-keyshortcuts="H" /> Hide rejected photos <kbd class="ml-auto font-mono text-[10px]">H</kbd></label>
                         </div>
                     </details>
                 </div>
 
                 <div class="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-2">
                     <div class="flex flex-wrap items-center gap-1" aria-label="Filter by flag">
-                        {#each [{ value: 'all', label: 'All photos', count: $libraryPhotos.length }, { value: 'pick', label: 'Picks', count: sessionPicks }, { value: 'reject', label: 'Rejects', count: sessionRejects }, { value: 'none', label: 'Unmarked', count: sessionUnmarked }] as item}
-                            <button class="flag-filter {cullFilter === item.value ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}" aria-pressed={cullFilter === item.value} onclick={() => setCullFilter(item.value as CullFilter)}>
+                        {#each [{ value: 'all', label: 'All photos', count: $libraryPhotos.length }, { value: 'pick', label: 'Picks', count: sessionPicks }, { value: 'reject', label: 'Rejects', count: sessionRejects }, { value: 'none', label: 'Unmarked', count: sessionUnmarked }] as item, index}
+                            <button class="flag-filter {cullFilter === item.value ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}" aria-pressed={cullFilter === item.value} aria-keyshortcuts="Alt+{index + 1}" title="{item.label} ({shortcutAlt}{index + 1})" onclick={() => setCullFilter(item.value as CullFilter)}>
                                 {#if item.value === 'pick'}<Check size={13} class="text-pick" />{:else if item.value === 'reject'}<X size={13} class="text-reject" />{:else if item.value === 'none'}<Circle size={12} />{/if}
                                 {item.label}<span class="font-mono text-[10px] opacity-70">{item.count}</span>
                             </button>
@@ -811,7 +886,7 @@
                         {/each}
                         <button class="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline" onclick={clearAllFilters}>Clear all</button>
                         {#if activeSavedSearchId}<span role="status" class="text-[11px] text-muted-foreground">Saved: {savedSearches.find((item) => item.id === activeSavedSearchId)?.name}</span>{/if}
-                        <button class="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground" onclick={() => { savedSearchName = activeSavedSearchId ? savedSearches.find((item) => item.id === activeSavedSearchId)?.name ?? "" : searchQuery; saveSearchDialog?.showModal(); }}><Save size={13} /> Save search</button>
+                        <button class="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground" onclick={openSaveSearch} aria-keyshortcuts="Control+S Meta+S" title="Save search ({shortcutMod}S)"><Save size={13} /> Save search</button>
                     </div>
                 {/if}
 
@@ -832,13 +907,13 @@
                                     <div class="min-w-0"><div class="truncate font-mono text-xs" title={cursorPhoto.file_name}>{cursorPhoto.file_name}</div><div class="mt-0.5 text-[11px] text-muted-foreground">Photo {$selectedIndex + 1} of {$displayPhotos.length}{#if cursorPhoto.paired_with} · RAW + JPEG{/if}</div></div>
                                 </div>
                                 <div class="flex items-center gap-1.5" aria-label="Selected photo actions">
-                                    <button class="ui-control" class:active-pick={cursorPhoto.flag === "pick"} aria-pressed={cursorPhoto.flag === "pick"} onclick={() => flagSelectedPhoto("pick")}><Check size={14} /> Pick {#if libraryView === "grid"}<kbd>P</kbd>{/if}</button>
-                                    <button class="ui-control" class:active-reject={cursorPhoto.flag === "reject"} aria-pressed={cursorPhoto.flag === "reject"} onclick={() => flagSelectedPhoto("reject")}><X size={14} /> Reject {#if libraryView === "grid"}<kbd>X</kbd>{/if}</button>
+                                    <button class="ui-control" class:active-pick={cursorPhoto.flag === "pick"} aria-pressed={cursorPhoto.flag === "pick"} onclick={() => flagSelectedPhoto("pick")} aria-keyshortcuts="P"><Check size={14} /> Pick <kbd>P</kbd></button>
+                                    <button class="ui-control" class:active-reject={cursorPhoto.flag === "reject"} aria-pressed={cursorPhoto.flag === "reject"} onclick={() => flagSelectedPhoto("reject")} aria-keyshortcuts="X"><X size={14} /> Reject <kbd>X</kbd></button>
                                     <button class="ui-control" onclick={() => flagSelectedPhoto("none")} title="Clear selected photo flag"><Circle size={13} /> Unmark</button>
                                 </div>
                             {/if}
                         </div>
-                        <p class="mt-2 text-[11px] text-muted-foreground">Click to select · Double-click or press Space to review {#if libraryView === "grid"}<span class="hidden min-[1100px]:inline">· P / X mark and advance · 1–5 rate</span>{/if}</p>
+                        <p class="mt-2 text-[11px] text-muted-foreground">Click to select · Double-click or press Space to review <span class="hidden min-[1100px]:inline">· P / X mark and advance · 1–5 rate · ? all shortcuts</span></p>
                     </footer>
                 {/if}
             {/if}
@@ -854,15 +929,21 @@
             <div class="mt-6 flex justify-end gap-2"><button type="button" class="ui-control" onclick={() => saveSearchDialog?.close()}>Cancel</button><button class="rounded-md bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground" type="submit">Save search</button></div>
         </form>
     </dialog>
-    <dialog bind:this={shortcutsDialog} class="ui-dialog" aria-labelledby="shortcuts-title">
+    <dialog bind:this={shortcutsDialog} class="ui-dialog shortcuts-dialog" aria-labelledby="shortcuts-title">
         <div class="flex items-center justify-between"><h2 id="shortcuts-title" class="text-lg font-semibold">Keyboard shortcuts</h2><button class="ui-control" aria-label="Close keyboard shortcuts" onclick={() => shortcutsDialog?.close()}><X size={16} /></button></div>
-        <p class="mt-2 text-sm text-muted-foreground">Select a photo in the grid to start. Picks, rejects and star ratings advance to the next photo.</p>
-        <dl class="mt-5 space-y-3 text-sm">
-            {#each [{ keys: '← ↑ ↓ →', action: 'Move through the grid' }, { keys: 'Space / Enter', action: 'Open selected photo' }, { keys: 'P / X', action: 'Pick / reject' }, { keys: 'U', action: 'Clear flag and rating' }, { keys: '0–5', action: 'Set star rating' }, { keys: '/', action: 'Search your library' }, { keys: 'Esc', action: 'Close a dialog or photo viewer' }] as shortcut}
-                <div class="flex items-center justify-between gap-4"><dt class="text-muted-foreground">{shortcut.action}</dt><dd class="rounded border border-border bg-secondary px-2 py-1 font-mono text-xs">{shortcut.keys}</dd></div>
+        <p class="mt-2 text-sm text-muted-foreground">Picks, rejects and star ratings advance to the next photo. Shortcuts pause while you type in a field; Esc leaves it.</p>
+        <div class="mt-5 gap-x-8 min-[760px]:columns-2">
+            {#each SHORTCUT_SECTIONS as section (section.title)}
+                <section class="mb-6 break-inside-avoid">
+                    <h3 class="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">{section.title}</h3>
+                    <dl class="space-y-1.5 text-sm">
+                        {#each section.items as shortcut}
+                            <div class="flex items-center justify-between gap-4"><dt class="text-muted-foreground">{shortcut.action}</dt><dd class="shrink-0 rounded border border-border bg-secondary px-2 py-0.5 font-mono text-xs">{shortcut.keys}</dd></div>
+                        {/each}
+                    </dl>
+                </section>
             {/each}
-        </dl>
-        <p class="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-muted-foreground">In the photo viewer: R switches RAW / JPEG, D compares, E opens adjustments, and F fits the photo.</p>
+        </div>
     </dialog>
 
     <dialog bind:this={smartCollectionsDialog} class="ui-dialog" aria-labelledby="smart-collections-title">
@@ -903,6 +984,7 @@
             allPhotos={$filteredPhotos}
             startIndex={previewScopeIds ? previewStartIndex : $selectedIndex}
             onConfirmCluster={previewConfirmCluster}
+            onRejectCluster={previewRejectCluster}
             onDecision={previewDecision}
             backgroundPreloadPhotos={previewPreloadPhotos}
         />
@@ -921,6 +1003,7 @@
     .flag-filter { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 9px; border-radius: 5px; font-size: 12px; white-space: nowrap; }
     .ui-dialog { position: fixed; inset: 0; width: min(440px, calc(100% - 32px)); max-height: calc(100vh - 48px); margin: auto; overflow-y: auto; padding: 24px; border: 1px solid var(--input); border-radius: 12px; background: var(--card); color: var(--foreground); box-shadow: 0 20px 80px #0008; }
     .ui-dialog::backdrop { background: #0009; }
+    .shortcuts-dialog { width: min(860px, calc(100% - 32px)); }
     .library-sidebar { height: 100%; flex-shrink: 0; }
     .sidebar-scrim { display: none; }
     summary::-webkit-details-marker { display: none; }

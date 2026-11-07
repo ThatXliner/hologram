@@ -17,6 +17,7 @@ import {
   planDecision,
   planKeepSelectedRejectRest,
   planKeepSuggested,
+  planRejectStack,
   pushHistory,
   replacedPairwise,
   resolutionStorageKey,
@@ -225,6 +226,16 @@ describe("review actions", () => {
     assert.deepEqual(changes.map((change) => [change.id, change.after.flag, change.after.rating]), [
       ["jpg", "pick", 3], ["raw", "pick", 0], ["other", "reject", 0],
     ]);
+  });
+
+  it("rejects every frame of a stack, picks and RAW partners included, keeping stars", () => {
+    const { byId } = lookup(all);
+    const changes = planRejectStack(stack, byId);
+    assert.deepEqual(changes.map((change) => [change.id, change.after.flag, change.after.rating]), [
+      ["jpg", "reject", 3], ["raw", "reject", 0], ["other", "reject", 0], ["picked", "reject", 0], ["rated", "reject", 2],
+    ]);
+    const after = applyChanges(byId, changes, "after");
+    assert.deepEqual(planRejectStack(stack, after), []);
   });
 
   it("requires a deliberate choice before finishing", () => {

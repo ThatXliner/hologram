@@ -202,9 +202,15 @@ try {
   assert.deepEqual(await decisions(page, libraryIds), initialDecisions, "Previewing the plan changes nothing");
 
   // No photo is on screen in the overview, so decision keys must do nothing.
-  for (const key of ["p", "x", "u", "3", "Enter", "s"]) await press(key);
+  for (const key of ["p", "x", "u", "3", "s", "Shift+X", "Shift+P"]) await press(key);
   assert.deepEqual(await decisions(page, libraryIds), initialDecisions, "Hidden decision keys are inert on the overview");
   assert.ok(await view.getByRole("button", { name: "Undo", exact: true }).isDisabled(), "Nothing entered the undo history");
+  // Enter starts the review and Esc returns, without deciding anything.
+  await press("Enter");
+  await view.locator("[data-autocull-queue]").waitFor();
+  await press("Escape");
+  await overview.waitFor();
+  assert.deepEqual(await decisions(page, libraryIds), initialDecisions, "Entering and leaving review changes nothing");
 
   // ── Manual review (before applying): queue, decisions, training, loupe ──────
   await view.getByRole("button", { name: "Review manually instead" }).click();
@@ -430,6 +436,33 @@ try {
   await press("Control+z");
   assert.deepEqual(await decisions(page, libraryIds), initialDecisions, "Every manual check above was undone");
   assert.ok(!(await refinedIds(page)).includes(frameOrder[0]), "Undo removes what the loupe decision taught");
+
+  // Reject stack (Shift+X): every frame, picks included, in one undo step that teaches no comparisons.
+  await view.locator(`[data-stack-key="${stackKey}"]`).click();
+  await filmstrip.locator(`[data-autocull-photo-id="${frameOrder[0]}"]`).click();
+  await press("p");
+  const pairwiseBeforeReject = await pairwiseCount(page);
+  await press("Shift+X");
+  const rejectedStack = await decisions(page, stackIds);
+  for (const id of stackIds) assert.equal(rejectedStack[id].flag, "reject", `${id}: Reject stack rejects every frame, picks included`);
+  assert.match(await status(), /Rejected all \d+ frames/);
+  assert.equal(await pairwiseCount(page), pairwiseBeforeReject, "A stack with no keeper teaches no comparisons");
+  assert.equal(await view.locator(`[data-stack-key="${stackKey}"]`).getAttribute("data-stack-status"), "done", "Reject stack finishes the stack");
+  assert.notEqual(await currentKey(), stackKey, "Reject stack moves on");
+  await press("Control+z");
+  const afterRejectUndo = await decisions(page, stackIds);
+  assert.equal(afterRejectUndo[frameOrder[0]].flag, "pick", "Undo restores the pick the stack reject overrode");
+  for (const id of stackIds.filter((id) => id !== frameOrder[0])) assert.equal(afterRejectUndo[id].flag, "none");
+  await press("Control+z"); // the pick
+  // The loupe rejects the whole stack too, then returns to the queue.
+  await view.locator(`[data-stack-key="${stackKey}"]`).click();
+  await press("Space");
+  await page.locator('[role="dialog"].fixed').waitFor();
+  await page.keyboard.press("Shift+X");
+  await page.locator('[role="dialog"].fixed').waitFor({ state: "detached" });
+  for (const [id, decision] of Object.entries(await decisions(page, stackIds))) assert.equal(decision.flag, "reject", `${id}: loupe Shift+X rejects the stack`);
+  await press("Control+z");
+  assert.deepEqual(await decisions(page, libraryIds), initialDecisions, "Reject stack undoes cleanly");
 
   // None of the decisions above may re-run analysis or rescan files.
   await page.waitForTimeout(900);

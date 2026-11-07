@@ -2,6 +2,7 @@
     import { onDestroy, onMount, tick } from "svelte";
     import { photoStore, selectedIndex, viewMode } from "../stores/photoStore.ts";
     import type { CullFlag, Photo } from "../types.ts";
+    import { cullKeyAction, keepsNativeActivation, shouldIgnoreShortcut } from "../shortcuts.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
 
     type GridDetails = "image" | "essentials" | "metadata";
@@ -123,32 +124,23 @@
     }
 
     function handleKeydown(event: KeyboardEvent) {
-        if ($viewMode === "viewer" || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
-        const target = event.target as HTMLElement;
-        if (target.closest("input, textarea, select, dialog, [contenteditable=true]")) return;
-        if ((event.key === "Enter" || event.key === " ") && target.closest("button, summary")) return;
+        if ($viewMode === "viewer" || shouldIgnoreShortcut(event) || event.metaKey || event.ctrlKey || event.altKey) return;
+        if (keepsNativeActivation(event)) return;
 
         const current = photos[$selectedIndex];
         if (!current) return;
 
-        if (event.key === "ArrowRight") {
+        const moves: Record<string, () => number> = {
+            ArrowRight: () => 1,
+            ArrowLeft: () => -1,
+            ArrowDown: () => estimateColumns(),
+            ArrowUp: () => -estimateColumns(),
+            Home: () => -$selectedIndex,
+            End: () => photos.length - 1 - $selectedIndex,
+        };
+        if (moves[event.key]) {
             event.preventDefault();
-            void moveCursor(1);
-            return;
-        }
-        if (event.key === "ArrowLeft") {
-            event.preventDefault();
-            void moveCursor(-1);
-            return;
-        }
-        if (event.key === "ArrowDown") {
-            event.preventDefault();
-            void moveCursor(estimateColumns());
-            return;
-        }
-        if (event.key === "ArrowUp") {
-            event.preventDefault();
-            void moveCursor(-estimateColumns());
+            void moveCursor(moves[event.key]());
             return;
         }
         if (event.key === "Enter" || event.key === " ") {
@@ -156,30 +148,12 @@
             openPhoto($selectedIndex);
             return;
         }
-        if (/^[0-5]$/.test(event.key)) {
-            event.preventDefault();
-            const rating = Number(event.key);
-            setRating(current, rating);
-            if (rating > 0) void moveCursor(1);
-            return;
-        }
-        if (event.key === "p" || event.key === "P") {
-            event.preventDefault();
-            setFlag(current, "pick");
-            void moveCursor(1);
-            return;
-        }
-        if (event.key === "x" || event.key === "X") {
-            event.preventDefault();
-            setFlag(current, "reject");
-            void moveCursor(1);
-            return;
-        }
-        if (event.key === "u" || event.key === "U") {
-            event.preventDefault();
-            setFlag(current, "none");
-            setRating(current, 0);
-        }
+        const cull = cullKeyAction(event);
+        if (!cull) return;
+        event.preventDefault();
+        if (cull.flag) setFlag(current, cull.flag);
+        if (cull.rating !== undefined) setRating(current, cull.rating);
+        if (cull.advance) void moveCursor(1);
     }
 
     function handleTileKeydown(event: KeyboardEvent, index: number) {

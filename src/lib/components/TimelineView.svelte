@@ -1,6 +1,8 @@
 <script lang="ts">
     import { CalendarDays, Check, FileImage, Info, XCircle } from "@lucide/svelte";
-    import { photoStore, selectedIndex } from "../stores/photoStore.ts";
+    import { tick } from "svelte";
+    import { photoStore, selectedIndex, viewMode } from "../stores/photoStore.ts";
+    import { cullKeyAction, keepsNativeActivation, shouldIgnoreShortcut } from "../shortcuts.ts";
     import type { Photo } from "../types.ts";
     import PhotoPreview from "./PhotoPreview.svelte";
 
@@ -16,6 +18,9 @@
     const timelineTileMinWidth = $derived(Math.max(112, Math.min(240, Math.round(tileMinWidth * 0.55))));
 
     const groupedPhotos = $derived(groupByDay(photos));
+    // Days are shown newest first, so keyboard order follows the screen, not the library.
+    const visualOrder = $derived(groupedPhotos.flatMap((group) => group.items));
+    let rootEl = $state<HTMLDivElement>();
 
     function groupByDay(items: Photo[]) {
         const groups = new Map<string, Photo[]>();
@@ -66,9 +71,76 @@
         photoStore.setSelectedIndex(index);
         photoStore.setViewMode("viewer");
     }
+
+    function tileFor(photoId: string | undefined): HTMLElement | null {
+        return photoId ? rootEl?.querySelector<HTMLElement>(`[data-timeline-photo-id="${CSS.escape(photoId)}"]`) ?? null : null;
+    }
+
+    async function focusPhoto(photo: Photo | undefined) {
+        if (!photo) return;
+        selectPhoto(photo);
+        await tick();
+        const tile = tileFor(photo.id);
+        tile?.focus({ preventScroll: true });
+        tile?.scrollIntoView({ block: "nearest" });
+    }
+
+    /** The closest tile in the next row up or down, by position: day sections end on ragged rows. */
+    function verticalNeighbor(current: Photo, direction: 1 | -1): Photo | undefined {
+        const from = tileFor(current.id)?.getBoundingClientRect();
+        if (!from || !rootEl) return undefined;
+        let best: { id: string; dy: number; dx: number } | null = null;
+        for (const tile of rootEl.querySelectorAll<HTMLElement>("[data-timeline-photo-id]")) {
+            const rect = tile.getBoundingClientRect();
+            const dy = (rect.top - from.top) * direction;
+            if (dy <= 1) continue;
+            const dx = Math.abs(rect.left - from.left);
+            if (!best || dy < best.dy - 1 || (Math.abs(dy - best.dy) <= 1 && dx < best.dx)) {
+                best = { id: tile.dataset.timelinePhotoId!, dy, dx };
+            }
+        }
+        return best ? visualOrder.find((photo) => photo.id === best!.id) : undefined;
+    }
+
+    function handleKeydown(event: KeyboardEvent) {
+        if ($viewMode === "viewer" || shouldIgnoreShortcut(event) || event.metaKey || event.ctrlKey || event.altKey) return;
+        if (keepsNativeActivation(event)) return;
+        const current = photos[$selectedIndex];
+        if (!current) return;
+        const position = visualOrder.findIndex((photo) => photo.id === current.id);
+
+        const moves: Record<string, () => Photo | undefined> = {
+            ArrowRight: () => visualOrder[position + 1],
+            ArrowLeft: () => visualOrder[position - 1],
+            ArrowDown: () => verticalNeighbor(current, 1),
+            ArrowUp: () => verticalNeighbor(current, -1),
+            Home: () => visualOrder[0],
+            End: () => visualOrder.at(-1),
+        };
+        if (moves[event.key]) {
+            event.preventDefault();
+            void focusPhoto(moves[event.key]());
+            return;
+        }
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            openPhoto(current);
+            return;
+        }
+        const cull = cullKeyAction(event);
+        if (!cull) return;
+        event.preventDefault();
+        for (const id of [current.id, current.paired_with].filter(Boolean) as string[]) {
+            if (cull.flag) photoStore.setPhotoFlag(id, cull.flag);
+            if (cull.rating !== undefined) photoStore.setPhotoRating(id, cull.rating);
+        }
+        if (cull.advance) void focusPhoto(visualOrder[position + 1]);
+    }
 </script>
 
-<div class="h-full overflow-y-auto px-5 py-4">
+<svelte:window onkeydown={handleKeydown} />
+
+<div bind:this={rootEl} class="h-full overflow-y-auto px-5 py-4">
     <div class="mx-auto flex max-w-7xl flex-col gap-6">
         {#each groupedPhotos as group (group.key)}
             <section class="min-w-0">
@@ -96,6 +168,7 @@
                                 }
                             }}
                             title={photo.file_name}
+                            data-timeline-photo-id={photo.id}
                         >
                             <div class="relative aspect-[3/2] bg-black">
                                 <PhotoPreview {photo} fit="contain" iconSize={28} />
