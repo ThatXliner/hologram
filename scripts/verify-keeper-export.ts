@@ -76,7 +76,7 @@ try {
         };
     });
     await page.goto(server.resolvedUrls!.local[0]);
-    await page.getByRole("button", { name: "Import Photos", exact: true }).click();
+    await page.getByRole("button", { name: "Open photo folder", exact: true }).click();
     await page.locator("[data-photo-card]").first().waitFor();
     await page.getByRole("button", { name: "AutoCull", exact: true }).click();
     const exportKeepers = page.locator("header [data-autocull-export]");
@@ -129,7 +129,7 @@ try {
     await page.getByRole("button", { name: "Back to AutoCull", exact: true }).click();
     assert.equal(await reviewNode?.evaluate((node) => node.isConnected), true);
     await page.getByRole("button", { name: "Export", exact: true }).click();
-    assert.match(await page.locator("body").innerText(), /Exporting visible library · 3 photos/);
+    assert.match(await page.locator("body").innerText(), /Exporting all photos · 3 photos/);
     assert.equal(await destination.inputValue(), "");
     await page.getByRole("button", { name: "Export 3", exact: true }).click();
     assert.equal(await page.evaluate(() => (window as any).__exportTest.exports.length), 2);

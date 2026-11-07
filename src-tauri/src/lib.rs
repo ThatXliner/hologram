@@ -16,7 +16,7 @@ use rusqlite;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::ipc::Response;
@@ -1896,6 +1896,24 @@ fn unique_path(path: PathBuf) -> PathBuf {
     path
 }
 
+fn same_file_contents(a: &Path, b: &Path) -> io::Result<bool> {
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (io::BufReader::new(fs::File::open(a)?), io::BufReader::new(fs::File::open(b)?));
+    let (mut buf_a, mut buf_b) = ([0u8; 64 * 1024], [0u8; 64 * 1024]);
+    loop {
+        let read = a.read(&mut buf_a)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut buf_b[..read])?;
+        if buf_a[..read] != buf_b[..read] {
+            return Ok(false);
+        }
+    }
+}
+
 fn resolve_export_items(photos: Vec<Photo>, all_photos: Vec<Photo>, pair_mode: &str) -> Vec<Photo> {
     let mut by_id: HashMap<String, Photo> = HashMap::new();
     for photo in all_photos.into_iter().chain(photos.clone()) {
@@ -2050,7 +2068,7 @@ mod export_tests {
             .await
             .unwrap();
         assert_eq!(repeated.exported_count, 2);
-        assert_eq!(photo_paths_in_folder(&destination).len(), 4);
+        assert_eq!(photo_paths_in_folder(&destination).len(), 3);
         assert_eq!(
             fs::read(destination.join("keeper.jpg")).unwrap(),
             b"existing destination"
@@ -2063,10 +2081,7 @@ mod export_tests {
             fs::read(destination.join("keeper.NEF")).unwrap(),
             b"keeper raw"
         );
-        assert_eq!(
-            fs::read(destination.join("keeper-2.NEF")).unwrap(),
-            b"keeper raw"
-        );
+        assert!(!destination.join("keeper-2.NEF").exists());
         for (name, _, _, _, bytes) in fixtures {
             assert_eq!(fs::read(source.join(name)).unwrap(), bytes);
         }
@@ -2101,7 +2116,7 @@ mod export_tests {
         .await
         .unwrap();
         assert!(!source.join(EXPORT_FOLDER_MARKER).exists());
-        assert_eq!(photo_paths_in_folder(&source).len(), 9);
+        assert_eq!(photo_paths_in_folder(&source).len(), 7);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2284,11 +2299,18 @@ async fn export_photos(
                 idx,
                 options.rename_pattern.as_deref(),
             ));
-            let dest = unique_path(output_path.join(&relative));
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::copy(src, &dest).map_err(|e| e.to_string())?;
+            let target = output_path.join(&relative);
+            // Re-running an export into the same folder must not pile up identical -2/-3 copies.
+            let dest = if target.is_file() && same_file_contents(src, &target).unwrap_or(false) {
+                target
+            } else {
+                let dest = unique_path(target);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::copy(src, &dest).map_err(|e| e.to_string())?;
+                dest
+            };
             let relative_to_output = dest
                 .strip_prefix(&output_path)
                 .unwrap_or(&dest)

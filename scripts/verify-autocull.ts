@@ -219,10 +219,10 @@ try {
   await openAdvanced();
   const beforeProgress = await view.locator("[data-autocull-progress]").innerText();
   const beforeAnalysis = (await invokeCounts(page)).find_missing_photo_ids;
-  for (const tab of ["Settings", "Export", "Grid"]) {
+  for (const tab of ["Settings", "Export", "Library"]) {
     await page.getByRole("button", { name: tab, exact: true }).click();
     assert.ok(await view.isHidden(), "AutoCull is hidden on the other tabs");
-    if (tab !== "Grid") {
+    if (tab !== "Library") {
       for (const key of ["p", "x", "u", "3", "Enter", "s", "Control+z", "Meta+z"]) await press(key);
       assert.deepEqual(await decisions(page, libraryIds), beforeLeaving, "Hidden AutoCull shortcuts cannot change decisions or undo");
     }
@@ -631,7 +631,7 @@ try {
   await setFilter("all");
   await view.locator('[data-stack-key="street"]').click();
   await press("5");
-  await page.getByRole("button", { name: "Grid", exact: true }).click();
+  await page.getByRole("button", { name: "Library", exact: true }).click();
   await page.evaluate(async () => {
     const storePath = "/src/lib/stores/photoStore.ts";
     const { photoStore } = await import(storePath) as typeof import("../src/lib/stores/photoStore.ts");
