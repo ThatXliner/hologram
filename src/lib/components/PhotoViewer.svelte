@@ -3,6 +3,7 @@
     import { onDestroy, onMount, tick } from "svelte";
     import { photoStore } from "../stores/photoStore.ts";
     import { HologramAPI } from "../api.ts";
+    import { hasCommandModifier, keepsNativeActivation, isTypingTarget } from "../shortcuts.ts";
     import type { CullFlag, Photo, PhotoDecisionHandler } from "../types.ts";
     import {
         Aperture,
@@ -35,6 +36,7 @@
         allPhotos: Photo[];
         startIndex?: number;
         onConfirmCluster?: (() => void) | null;
+        onRejectCluster?: (() => void) | null;
         onDecision?: PhotoDecisionHandler | null;
         backgroundPreloadPhotos?: Photo[];
     }
@@ -81,6 +83,7 @@
         allPhotos,
         startIndex = 0,
         onConfirmCluster = null,
+        onRejectCluster = null,
         onDecision = null,
         backgroundPreloadPhotos = [],
     }: Props = $props();
@@ -201,6 +204,7 @@
     );
 
     let tagInput = $state("");
+    let tagField = $state<HTMLInputElement>();
     let notesValue = $state("");
     let actionMessage = $state<string | null>(null);
     let editorResetToken = $state(0);
@@ -370,6 +374,11 @@
         closeViewer();
     }
 
+    function rejectClusterAndReturn() {
+        onRejectCluster?.();
+        closeViewer();
+    }
+
     function handleBackdropClick(event: MouseEvent) {
         if (event.target === event.currentTarget) closeViewer();
     }
@@ -500,13 +509,18 @@
         void loadCurrentPhoto();
     }
 
-    function isTypingTarget(target: EventTarget | null): boolean {
-        const el = target as HTMLElement | null;
-        return !!el && ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
-    }
-
     function handleKeydown(event: KeyboardEvent) {
-        if (isTypingTarget(event.target)) return;
+        if (event.defaultPrevented) return;
+        if (isTypingTarget(event.target)) {
+            // Esc leaves the field so viewer keys work again; a second Esc closes the viewer.
+            if (event.key === "Escape") {
+                event.preventDefault();
+                (event.target as HTMLElement).blur();
+            }
+            return;
+        }
+        if (hasCommandModifier(event) || event.altKey) return;
+        if (keepsNativeActivation(event)) return;
 
         if (exposureHelpKey) {
             if (event.key === "Escape") {
@@ -516,11 +530,45 @@
             return;
         }
 
+        if (event.shiftKey && event.key.toLowerCase() === "x" && onRejectCluster) {
+            event.preventDefault();
+            rejectClusterAndReturn();
+            return;
+        }
+
         switch (event.key) {
             case "Escape":
                 if (showEditor) showEditor = false;
                 else if (zoomLevel > 1) resetZoom();
                 else closeViewer();
+                break;
+            case " ":
+                event.preventDefault();
+                closeViewer();
+                break;
+            case "Enter":
+                if (!onConfirmCluster) break;
+                event.preventDefault();
+                confirmClusterAndReturn();
+                break;
+            case "Home":
+                event.preventDefault();
+                navigateTo(0);
+                break;
+            case "End":
+                event.preventDefault();
+                navigateTo(photos.length - 1);
+                break;
+            case "a":
+            case "A":
+                event.preventDefault();
+                autoAdvance = !autoAdvance;
+                break;
+            case "t":
+            case "T":
+                if (showEditor || !tagField) break;
+                event.preventDefault();
+                tagField.focus();
                 break;
             case "ArrowLeft":
                 event.preventDefault();
@@ -1478,7 +1526,7 @@
                         <h3 class="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-subtle">Cull</h3>
                         <label class="flex items-center gap-2 text-xs text-muted-foreground">
                             <input type="checkbox" bind:checked={autoAdvance} class="accent-primary" />
-                            Auto advance
+                            Auto advance <kbd class="font-mono text-[10px] text-subtle">A</kbd>
                         </label>
                     </div>
                     <div class="mb-3 flex items-center gap-1">
@@ -1679,8 +1727,9 @@
                         </div>
                         <input
                             type="text"
-                            placeholder="Add tag"
+                            placeholder="Add tag (T)"
                             class="mb-2 h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40"
+                            bind:this={tagField}
                             bind:value={tagInput}
                             onkeydown={handleTagKeydown}
                         />
@@ -1745,8 +1794,17 @@
                 <button
                     class="inline-flex h-10 shrink-0 items-center justify-center rounded-md bg-primary px-4 text-xs font-bold text-primary-foreground transition-opacity hover:opacity-90"
                     onclick={confirmClusterAndReturn}
-                    title="Confirm your keepers, train your taste profile, and return to the next cluster"
-                >Confirm &amp; next cluster →</button>
+                    aria-keyshortcuts="Enter"
+                    title="Confirm your keepers, train your taste profile, and return to the next cluster (Enter)"
+                >Confirm &amp; next cluster ↵</button>
+            {/if}
+            {#if onRejectCluster}
+                <button
+                    class="inline-flex h-10 shrink-0 items-center justify-center rounded-md border border-reject/40 px-3 text-xs font-bold text-reject transition-colors hover:bg-reject/10"
+                    onclick={rejectClusterAndReturn}
+                    aria-keyshortcuts="Shift+X"
+                    title="Nothing here is a keeper: reject every frame in this stack and return to the next one (Shift+X)"
+                >Reject stack ⇧X</button>
             {/if}
         </footer>
         {:else}

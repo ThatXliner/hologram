@@ -65,6 +65,7 @@
         planDecision,
         planKeepSelectedRejectRest,
         planKeepSuggested,
+        planRejectStack,
         pushHistory,
         replacedPairwise,
         restoreRefinements,
@@ -94,6 +95,7 @@
     import { HologramAPI } from "../api.ts";
     import { photoStore, viewMode } from "../stores/photoStore.ts";
     import { xmpImportState } from "../xmpImport.ts";
+    import { altDigit, hasCommandModifier, keepsNativeActivation, shortcutAlt, shortcutMod, shouldIgnoreShortcut } from "../shortcuts.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
     import type { AutoCullLabel, AutoCullLearner, AutoCullSession, Photo, PhotoDecisionHandler, VisualIndexProgress } from "../types.ts";
 
@@ -108,6 +110,7 @@
             onConfirmCluster?: () => void,
             preloadPhotoIds?: string[],
             onDecision?: PhotoDecisionHandler,
+            onRejectCluster?: () => void,
         ) => void;
     }
 
@@ -879,6 +882,21 @@
         goToNextPending(stack.key, stack.key);
     }
 
+    /** Nothing here is a keeper: reject every frame, close the stack, and move on. */
+    function rejectStack(stack: ReviewStack | null = currentStack) {
+        if (!stack) return;
+        const changes = planRejectStack(stack, lookupById);
+        const multi = stack.photoIds.length > 1;
+        const result = commit("reject stack", changes, { resolveStack: multi ? stack : null, confirmIds: stack.photoIds });
+        if (!result) return;
+        status = (multi ? `Rejected all ${stack.photoIds.length} frames` : `Rejected ${photoName(stack.photoIds[0])}`) + outcomeNote(result);
+        goToNextPending(stack.key, stack.key);
+    }
+
+    function rejectStackByKey(key: string) {
+        rejectStack(stackByKey.get(key) ?? null);
+    }
+
     function stackHasAutomatic(stack: ReviewStack): boolean {
         return stack.photoIds.some((id) => pairedIds(id, lookupById).some(isAutomatic));
     }
@@ -948,58 +966,84 @@
             .flatMap((item) => item.photoIds)
             .slice(0, Math.max(0, 8 - stack.photoIds.length));
         const key = stack.key;
-        onOpenPreview(stack.photoIds, photoId, stack.photoIds.length > 1 ? () => finishStackByKey(key) : undefined, following, loupeDecision);
+        onOpenPreview(
+            stack.photoIds,
+            photoId,
+            stack.photoIds.length > 1 ? () => finishStackByKey(key) : undefined,
+            following,
+            loupeDecision,
+            stack.photoIds.length > 1 ? () => rejectStackByKey(key) : undefined,
+        );
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
 
-    function isTypingTarget(target: EventTarget | null): boolean {
-        const element = target as HTMLElement | null;
-        return !!element && (element.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName));
-    }
-
-    function isActivatable(target: EventTarget | null): boolean {
-        const element = target as HTMLElement | null;
-        return !!element && ["BUTTON", "A", "SUMMARY"].includes(element.tagName);
-    }
-
     function handleKeydown(event: KeyboardEvent) {
-        if (!active || event.defaultPrevented || isTypingTarget(event.target) || $viewMode === "viewer") return;
-        const mod = event.metaKey || event.ctrlKey;
-        if (mod && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "z") {
+        if (!active || shouldIgnoreShortcut(event)) return;
+        const mod = hasCommandModifier(event);
+        const plainMod = mod && !event.shiftKey && !event.altKey;
+        // Loupe decisions share this history, so undo works there too.
+        if (plainMod && event.key.toLowerCase() === "z") {
             event.preventDefault();
             undo();
             return;
         }
-        if (mod || event.altKey || !session) return;
-        if (event.key === "Escape" && showDetails) {
-            showDetails = false;
+        if ($viewMode === "viewer") return;
+        if (plainMod && event.key.toLowerCase() === "e") {
+            event.preventDefault();
+            if (keeperIds.length && !isAnalyzing) onExportKeepers(keeperIds);
             return;
         }
-        // The overview and the completion screen show no photo: decision keys would act unseen.
-        if (mode !== "review" || completionVisible || !currentStack) return;
+        if (mod || !session) return;
+        const filterNumber = altDigit(event);
+        if (filterNumber !== null) {
+            const option = filterOptions[filterNumber - 1];
+            if (mode !== "review" || !option) return;
+            event.preventDefault();
+            filter = option[0];
+            justCompleted = false;
+            return;
+        }
+        if (event.altKey) return;
+        if (event.key === "Escape") {
+            if (showDetails) showDetails = false;
+            else if (mode === "review") showOverview();
+            return;
+        }
         // Let focused buttons keep their native Enter/Space activation.
-        if ((event.key === "Enter" || event.key === " ") && isActivatable(event.target)) return;
+        if (keepsNativeActivation(event)) return;
 
         const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
-        const actions: Record<string, () => void> = {
-            ArrowRight: () => stepFrame(1),
-            ArrowLeft: () => stepFrame(-1),
-            ArrowDown: () => stepStack(1),
-            ArrowUp: () => stepStack(-1),
-            Enter: () => finishStack(),
-            n: () => skipStack(),
-            p: () => keep(true),
-            x: () => reject(true),
-            u: () => clearDecision(),
-            s: () => keepSuggested(),
-        };
-        if (/^[0-5]$/.test(key)) {
-            event.preventDefault();
-            rate(Number(key), Number(key) > 0);
+        let action: (() => void) | undefined;
+        if (key === "r" && !event.shiftKey) {
+            action = refreshAnalysis;
+        } else if (mode === "overview") {
+            if (!event.shiftKey) action = ({ Enter: () => startReview(), a: applyAutoCull } as Record<string, () => void>)[key];
+        } else if (completionVisible || !currentStack || !selectedPhotoId) {
+            // The completion screen shows no photo: decision keys would act unseen.
             return;
+        } else if (event.shiftKey) {
+            action = ({ p: keepSelectedRejectRest, x: () => rejectStack() } as Record<string, () => void>)[key];
+        } else if (/^[0-5]$/.test(key)) {
+            action = () => rate(Number(key), Number(key) > 0);
+        } else {
+            const photoId = selectedPhotoId;
+            const actions: Record<string, () => void> = {
+                ArrowRight: () => stepFrame(1),
+                ArrowLeft: () => stepFrame(-1),
+                ArrowDown: () => stepStack(1),
+                ArrowUp: () => stepStack(-1),
+                Enter: () => finishStack(),
+                " ": () => openInLoupe(photoId),
+                n: () => skipStack(),
+                p: () => keep(true),
+                x: () => reject(true),
+                u: () => clearDecision(),
+                s: () => keepSuggested(),
+                i: () => { if (!wide) showDetails = !showDetails; },
+            };
+            action = actions[key];
         }
-        const action = actions[key];
         if (!action) return;
         event.preventDefault();
         action();
@@ -1084,7 +1128,6 @@
         return `${count} ${word}${count === 1 ? "" : "s"}`;
     }
 
-    const shortcutMod = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl+";
 </script>
 
 <svelte:window onkeydown={handleKeydown} bind:innerWidth />
@@ -1162,6 +1205,8 @@
         class="inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-40 {primary ? 'bg-primary text-primary-foreground hover:opacity-90' : 'border border-border text-muted-foreground hover:bg-secondary hover:text-foreground'}"
         onclick={() => onExportKeepers(keeperIds)}
         disabled={keeperIds.length === 0 || isAnalyzing}
+        aria-keyshortcuts="Control+E Meta+E"
+        title="Export keepers ({shortcutMod}E)"
         data-autocull-export
     ><Download size={14} />Export keepers · {keeperIds.length}</button>
 {/snippet}
@@ -1241,18 +1286,21 @@
                             : $xmpImportState.error ? "Fix the XMP import first."
                             : analysisError ? "The last analysis failed. Retry before applying."
                             : analysisInterrupted ? "Refresh analysis before applying these suggestions." : undefined}
+                        aria-keyshortcuts="A"
                         data-autocull-apply
-                    ><WandSparkles size={15} />Apply AutoCull</button>
+                    ><WandSparkles size={15} />Apply AutoCull {@render kbd("A")}</button>
                     <button
                         class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                         onclick={() => startReview()}
-                    >Review manually instead</button>
+                        aria-keyshortcuts="Enter"
+                    >Review manually instead {@render kbd("↵")}</button>
                 {:else}
                     <button
                         class="inline-flex h-9 items-center gap-2 rounded-md px-4 text-[13px] font-semibold transition-opacity hover:opacity-90 {o.pending.length ? 'bg-primary text-primary-foreground' : 'border border-border text-muted-foreground'}"
                         onclick={() => startReview()}
                         data-autocull-review-exceptions
-                    ><ListChecks size={15} />{o.pending.length ? `Review ${plural(o.pending.length, "exception")}` : "Browse all stacks"}</button>
+                        aria-keyshortcuts="Enter"
+                    ><ListChecks size={15} />{o.pending.length ? `Review ${plural(o.pending.length, "exception")}` : "Browse all stacks"} {@render kbd("↵")}</button>
                     {#if lastLabel === AUTO_LABEL}
                         <button
                             class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
@@ -1469,7 +1517,8 @@
                     onclick={showOverview}
                     data-autocull-show-overview
                     aria-label="Back to AutoCull summary"
-                    title="Back to the AutoCull summary"
+                    aria-keyshortcuts="Escape"
+                    title="Back to the AutoCull summary (Esc)"
                 ><ChevronLeft size={13} />AutoCull</button>
             {:else}
                 <span class="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-subtle">AutoCull</span>
@@ -1491,10 +1540,12 @@
         </div>
         {#if session && mode === "review"}
             <div class="flex overflow-hidden rounded-md border border-border text-[11px] font-medium" role="group" aria-label="Queue filter">
-                {#each filterOptions as [value, label, count] (value)}
+                {#each filterOptions as [value, label, count], index (value)}
                     <button
                         class="px-2.5 py-[5px] transition-colors {filter === value ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}"
                         aria-pressed={filter === value}
+                        aria-keyshortcuts="Alt+{index + 1}"
+                        title="{label} ({shortcutAlt}{index + 1})"
                         data-filter={value}
                         onmousedown={keepFocus}
                         onclick={() => { filter = value; justCompleted = false; }}
@@ -1523,7 +1574,8 @@
                 onclick={refreshAnalysis}
                 disabled={isAnalyzing || photos.length === 0}
                 aria-label="Refresh analysis"
-                title={decisionsSinceAnalysis > 0 ? `Re-rank with ${decisionsSinceAnalysis} newer decision${decisionsSinceAnalysis === 1 ? "" : "s"}` : "Re-run analysis"}
+                aria-keyshortcuts="R"
+                title={decisionsSinceAnalysis > 0 ? `Re-rank with ${decisionsSinceAnalysis} newer decision${decisionsSinceAnalysis === 1 ? "" : "s"} (R)` : "Re-run analysis (R)"}
             >
                 {#if isAnalyzing}<Loader2 size={13} class="animate-spin" />{:else}<RefreshCw size={13} />{/if}
                 <span class="hidden md:inline">Refresh</span>
@@ -1649,7 +1701,7 @@
                         </div>
                         <div class="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-between gap-2 p-2.5">
                             <span class="max-w-[70%] truncate rounded bg-black/65 px-2 py-[3px] font-mono text-[10.5px] text-white/80" role="status" aria-live="polite" data-autocull-status>{status || "Ready"}</span>
-                            <button class="pointer-events-auto inline-flex items-center gap-1 rounded bg-black/65 px-2 py-[3px] font-mono text-[10px] text-white/80 transition-colors hover:text-white" onmousedown={keepFocus} onclick={() => openInLoupe(selectedPhoto.id)}><Maximize2 size={11} />Loupe</button>
+                            <button class="pointer-events-auto inline-flex items-center gap-1 rounded bg-black/65 px-2 py-[3px] font-mono text-[10px] text-white/80 transition-colors hover:text-white" onmousedown={keepFocus} onclick={() => openInLoupe(selectedPhoto.id)} aria-keyshortcuts="Space" title="Open the loupe (Space)"><Maximize2 size={11} />Loupe</button>
                         </div>
                     </div>
 
@@ -1659,7 +1711,7 @@
                             <span class="shrink-0 rounded border px-1.5 py-px font-mono text-[10px] font-semibold {badge.cls}">{badge.text}</span>
                             {#if stack.closeCall && !stackHasPick(stack)}<span class="shrink-0 font-mono text-[10px] text-info">close call</span>{/if}
                             <span class="min-w-0 flex-1 truncate text-muted-foreground">{suggestionReasons(selectedRec)[0] ?? ""}</span>
-                            <button class="inline-flex shrink-0 items-center gap-1 rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground hover:text-foreground" onmousedown={keepFocus} onclick={() => (showDetails = !showDetails)} aria-expanded={showDetails}><PanelRight size={12} />Details</button>
+                            <button class="inline-flex shrink-0 items-center gap-1 rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground hover:text-foreground" onmousedown={keepFocus} onclick={() => (showDetails = !showDetails)} aria-expanded={showDetails} aria-keyshortcuts="I" title="Show or hide details (I)"><PanelRight size={12} />Details</button>
                         </div>
                     {/if}
 
@@ -1715,7 +1767,7 @@
                             disabled={!isDecided(selectedDecision)}
                             aria-label="Clear"
                             aria-keyshortcuts="U"
-                        ><Circle size={13} />Clear</button>
+                        ><Circle size={13} />Clear {@render kbd("U")}</button>
                         <div class="flex items-center gap-0.5" role="group" aria-label="Star rating">
                             {#each [1, 2, 3, 4, 5] as rating}
                                 <button
@@ -1744,9 +1796,18 @@
                                     onmousedown={keepFocus}
                                     onclick={keepSelectedRejectRest}
                                     data-autocull-keep-reject-rest
+                                    aria-keyshortcuts="Shift+P"
                                     title="Keep this frame and reject the {rejectRestCount} frame{rejectRestCount === 1 ? '' : 's'} with no decision yet. Existing picks, ratings and rejects stay as they are. Undo with {shortcutMod}Z."
-                                >Keep this &amp; reject {rejectRestCount} other{rejectRestCount === 1 ? "" : "s"}</button>
+                                >Keep this &amp; reject {rejectRestCount} other{rejectRestCount === 1 ? "" : "s"} {@render kbd("⇧P")}</button>
                             {/if}
+                            <button
+                                class="inline-flex h-8 items-center gap-1.5 rounded-md border border-reject/35 px-2.5 text-[11.5px] font-semibold text-reject transition-colors hover:bg-reject/10"
+                                onmousedown={keepFocus}
+                                onclick={() => rejectStack()}
+                                data-autocull-reject-stack
+                                aria-keyshortcuts="Shift+X"
+                                title="Nothing here is a keeper: reject all {stack.photoIds.length} frames, including any picks, and go to the next stack. Star ratings stay. Undo with {shortcutMod}Z."
+                            ><XCircle size={13} />Reject stack {@render kbd("⇧X")}</button>
                         {/if}
                         <div class="flex-1"></div>
                         <button

@@ -152,6 +152,14 @@ export function planKeepSelectedRejectRest(
   return [...keep, ...reject];
 }
 
+/**
+ * Nothing in the stack is a keeper: reject every frame, picks included, and both
+ * halves of each RAW+JPEG pair. Star ratings stay as they are.
+ */
+export function planRejectStack(stack: ReviewStack, byId: Map<string, Photo>): DecisionChange[] {
+  return planDecision(stack.photoIds, byId, { flag: "reject" });
+}
+
 export function applyChanges(byId: Map<string, Photo>, changes: DecisionChange[], direction: "after" | "before"): Map<string, Photo> {
   const next = new Map(byId);
   for (const change of changes) {
