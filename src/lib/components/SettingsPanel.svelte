@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { LayoutGrid, RotateCcw, Settings, Sparkles } from "@lucide/svelte";
+    import { Brain, LayoutGrid, RotateCcw, Settings, Sparkles } from "@lucide/svelte";
+    import { MAX_REJECT_PERCENT, type TasteSettings } from "../tasteSettings.ts";
 
     type GridDetails = "image" | "essentials" | "metadata";
 
@@ -9,6 +10,8 @@
         gridTileSize: number;
         gridDetailMode: GridDetails;
         smartCollectionsEnabled: boolean;
+        tasteSettings: TasteSettings;
+        onTasteSettingsChange: (settings: TasteSettings) => void;
         onGridZoomChange: (level: number) => void;
         onGridDetailChange: (mode: GridDetails) => void;
         onSmartCollectionsChange: (enabled: boolean) => void;
@@ -21,6 +24,8 @@
         gridTileSize,
         gridDetailMode,
         smartCollectionsEnabled,
+        tasteSettings,
+        onTasteSettingsChange,
         onGridZoomChange,
         onGridDetailChange,
         onSmartCollectionsChange,
@@ -117,6 +122,47 @@
                     <span class="absolute top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-all {smartCollectionsEnabled ? 'left-6' : 'left-1'}"></span>
                 </button>
             </div>
+        </section>
+
+        <section class="rounded-lg border border-border bg-card" data-taste-settings>
+            <div class="flex items-center gap-3 p-4">
+                <div class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-primary/15 text-primary">
+                    <Brain size={17} />
+                </div>
+                <div class="min-w-0 flex-1">
+                    <h2 class="text-sm font-semibold text-foreground">AutoCull taste model <span class="ml-1 rounded bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Beta</span></h2>
+                    <p class="mt-0.5 text-xs text-muted-foreground">Ranks new shoots using image quality plus what you kept and rejected in past shoots. Downloads a 340 MB image model once; everything runs on this computer.</p>
+                </div>
+                <button
+                    class="relative h-6 w-11 shrink-0 rounded-full transition-colors {tasteSettings.enabled ? 'bg-primary' : 'bg-secondary'}"
+                    onclick={() => onTasteSettingsChange({ ...tasteSettings, enabled: !tasteSettings.enabled })}
+                    role="switch"
+                    aria-checked={tasteSettings.enabled}
+                    aria-label="AutoCull taste model"
+                >
+                    <span class="absolute top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-all {tasteSettings.enabled ? 'left-6' : 'left-1'}"></span>
+                </button>
+            </div>
+            {#if tasteSettings.enabled}
+                <div class="border-t border-border p-4">
+                    <label class="block">
+                        <span class="flex items-center justify-between text-xs font-medium text-foreground">
+                            Pre-mark as reject
+                            <span class="font-mono text-[11px] text-subtle">{tasteSettings.rejectPercent === 0 ? "off" : `lowest ${tasteSettings.rejectPercent}%`}</span>
+                        </span>
+                        <input
+                            class="grid-zoom-slider mt-3 h-6 w-full"
+                            type="range"
+                            min="0"
+                            max={MAX_REJECT_PERCENT}
+                            step="5"
+                            value={tasteSettings.rejectPercent}
+                            oninput={(event) => onTasteSettingsChange({ ...tasteSettings, rejectPercent: Number(event.currentTarget.value) })}
+                        />
+                    </label>
+                    <p class="mt-2 text-[11px] leading-4 text-muted-foreground">How much of each shoot AutoCull marks as reject, lowest-ranked first. The next 10% are marked for review. Shoots differ a lot, so start low; you can undo any mark.</p>
+                </div>
+            {/if}
         </section>
     </div>
 </main>

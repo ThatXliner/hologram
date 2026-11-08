@@ -17,6 +17,7 @@
     import PhotoViewer from "../lib/components/PhotoViewer.svelte";
     import ExportPanel from "../lib/components/ExportPanel.svelte";
     import SettingsPanel from "../lib/components/SettingsPanel.svelte";
+    import { loadTasteSettings, saveTasteSettings } from "../lib/tasteSettings.ts";
     import { HologramAPI } from "../lib/api.ts";
     import { buildSmartCollections } from "../lib/collections.ts";
     import { indexPhotoVisuals } from "../lib/visualIndex.ts";
@@ -72,6 +73,7 @@
     let activeSmartCollectionId = $state<string | null>(null);
     let didLoadGridPreferences = $state(false);
     let smartCollectionsEnabled = $state(false);
+    let tasteSettings = $state(loadTasteSettings());
     let smartCollectionsDialog = $state<HTMLDialogElement>();
     let isVisualIndexing = $state(false);
     let visualIndex = $state<Record<string, VisualIndexEntry>>({});
@@ -760,13 +762,14 @@
 
     {#if autoCullVisited && hasLibrary}
         <div class="min-w-0 flex-1 overflow-y-auto bg-background" hidden={effectiveRail !== "autocull"} inert={effectiveRail !== "autocull"}>
-            <AutoCullView photos={$displayPhotos} allPhotos={$photos} active={effectiveRail === "autocull"} onOpenPreview={openScopedPreview} onExportKeepers={exportKeepers} />
+            <AutoCullView photos={$displayPhotos} allPhotos={$photos} active={effectiveRail === "autocull"} {tasteSettings} onOpenPreview={openScopedPreview} onExportKeepers={exportKeepers} />
         </div>
     {/if}
 
     {#if effectiveRail === "settings"}
         <SettingsPanel
-            {gridZoomLevel} {maxGridZoomLevel} {gridTileSize} {gridDetailMode} {smartCollectionsEnabled}
+            {gridZoomLevel} {maxGridZoomLevel} {gridTileSize} {gridDetailMode} {smartCollectionsEnabled} {tasteSettings}
+            onTasteSettingsChange={(next) => (tasteSettings = saveTasteSettings(next))}
             onGridZoomChange={setGridZoomLevel}
             onGridDetailChange={setGridDetailMode}
             onSmartCollectionsChange={setSmartCollectionsEnabled}

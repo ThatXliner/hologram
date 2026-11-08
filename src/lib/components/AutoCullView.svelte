@@ -98,11 +98,13 @@
     import { altDigit, hasCommandModifier, keepsNativeActivation, shortcutAlt, shortcutMod, shouldIgnoreShortcut } from "../shortcuts.ts";
     import PhotoPreviewCard from "./PhotoPreviewCard.svelte";
     import type { AutoCullLabel, AutoCullLearner, AutoCullSession, Photo, PhotoDecisionHandler, VisualIndexProgress } from "../types.ts";
+    import { DEFAULT_TASTE_SETTINGS, type TasteSettings } from "../tasteSettings.ts";
 
     interface Props {
         photos: Photo[];
         allPhotos: Photo[];
         active: boolean;
+        tasteSettings?: TasteSettings;
         onExportKeepers: (photoIds: string[]) => void;
         onOpenPreview: (
             photoIds: string[],
@@ -114,7 +116,7 @@
         ) => void;
     }
 
-    let { photos, allPhotos, active, onOpenPreview, onExportKeepers }: Props = $props();
+    let { photos, allPhotos, active, tasteSettings = DEFAULT_TASTE_SETTINGS, onOpenPreview, onExportKeepers }: Props = $props();
     const keeperIds = $derived(photos.filter((photo) => photo.flag === "pick").map((photo) => photo.id));
 
     type Mode = "overview" | "review";
@@ -321,6 +323,7 @@
         return [
             folder ?? "",
             profileId,
+            tasteSettings.enabled ? `taste:${tasteSettings.rejectPercent}` : "default",
             items.map((photo) => [
                 photo.id,
                 photo.file_path,
@@ -351,6 +354,7 @@
         const library = allPhotos;
         const folder = folderPath;
         const profileId = activePreferenceProfileId;
+        const taste = tasteSettings;
         lastAnalysisKey = analysisInputKey(input, profileId, folder);
         if (input.length === 0) {
             session = null;
@@ -394,8 +398,9 @@
                 // AutoCull's own flags are not the photographer's taste: never learn from them.
                 automaticFeedbackPhotoIds({ photos: library, refinements, pairs: preferences, automatic }),
                 profileId,
-                "auto",
+                taste.enabled ? "taste" : "auto",
                 isCurrent,
+                taste.rejectPercent / 100,
             );
             if (!isCurrent()) return;
             session = next;
