@@ -37,6 +37,22 @@ describe("automatic cull policy", () => {
     assert.equal(result.changes.length, 2);
   });
 
+  it("follows the taste model's labels and reject cutoff instead of technical thresholds", () => {
+    const photos = ["top", "low", "sharp-but-low", "middle"].map((id) => photo(id));
+    const records = [
+      { ...analysis("top", 0.3), recommendation: "SELECT" as const },
+      { ...analysis("low", 0.9), recommendation: "REJECT" as const },
+      { ...analysis("sharp-but-low", 0.95), recommendation: "REJECT" as const },
+      { ...analysis("middle", 0.1), recommendation: "MAYBE" as const },
+    ];
+    const tasteSession: AutoCullSession = { ...session(records), learner: { engine: "taste", version: "taste-r5-v1", lambda: 0.5,
+      shoots: 3, training_rows: 40, train_ms: 1, reject_percent: 50, missing_embeddings: 0 } };
+    const result = buildAutoCullPlan(photos, photos, tasteSession);
+    assert.deepEqual(result.keepIds, ["top"]);
+    assert.deepEqual(result.rejectIds, ["low", "sharp-but-low"]);
+    assert.deepEqual(result.reviewIds, ["middle"]);
+  });
+
   it("resolves a clear visual winner but leaves distinct close calls for review", () => {
     const photos = [photo("a"), photo("b")];
     const records = [analysis("a", 0.8, 0.75), analysis("b", 0.7, 0.6, [0.95, 0.312])];

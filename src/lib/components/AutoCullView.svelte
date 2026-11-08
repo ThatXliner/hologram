@@ -1246,7 +1246,7 @@
                 </h2>
                 <p class="mt-1 max-w-[560px] text-[12px] leading-relaxed text-muted-foreground">
                     {#if !o.applied}
-                        Sharp singles and clear stack winners are kept; soft, clipped and near-duplicate frames are rejected. Close calls and missing previews wait for you. Flags only, one undo step.
+                        {#if session?.learner?.engine === "taste"}Top-ranked singles and clear stack winners are kept; the lowest {session.learner.reject_percent}% of this shoot and near-duplicates of a winner are rejected.{:else}Sharp singles and clear stack winners are kept; soft, clipped and near-duplicate frames are rejected.{/if} Close calls and missing previews wait for you. Flags only, one undo step.
                     {:else if o.pending.length}
                         Review the close calls and unclear frames. Changing or confirming an AutoCull flag makes it yours, and only your choices teach the profile.
                     {:else}

@@ -109,6 +109,10 @@ export function buildAutoCullPlan(photos: Photo[], allPhotos: Photo[], session: 
 } {
   const byId = new Map(allPhotos.map((photo) => [photo.id, photo]));
   const analyzed = new Map(session.photos.map((photo) => [photo.photo_id, photo]));
+  // The opt-in taste model ranks within the shoot; its labels carry the user's reject cutoff.
+  const taste = session.learner?.engine === "taste";
+  const keepSingle = (rec: AutoCullPhoto) => (taste ? rec.recommendation === "SELECT" : rec.technical_score >= 0.7);
+  const rejectOutright = (rec: AutoCullPhoto) => (taste ? rec.recommendation === "REJECT" : rec.technical_score <= 0.25);
   const decisions = new Map<string, PhotoDecision>();
   const protectedPhoto = (id: string) => pairedIds(id, byId).some((member) => isDecided(normalizeDecision(byId.get(member))));
   const decide = (id: string, flag: "pick" | "reject") => {
@@ -123,8 +127,8 @@ export function buildAutoCullPlan(photos: Photo[], allPhotos: Photo[], session: 
       const id = stack.photoIds[0];
       const rec = analyzed.get(id);
       if (!hasEvidence(rec)) return;
-      if (rec.technical_score >= 0.7) decide(id, "pick");
-      else if (rec.technical_score <= 0.25) decide(id, "reject");
+      if (keepSingle(rec)) decide(id, "pick");
+      else if (rejectOutright(rec)) decide(id, "reject");
       return;
     }
     const candidates = stack.photoIds.map((id) => analyzed.get(id)).filter(hasEvidence)
@@ -136,7 +140,7 @@ export function buildAutoCullPlan(photos: Photo[], allPhotos: Photo[], session: 
     const nearDuplicates = winner && candidates.length === stack.photoIds.length
       && candidates.every((rec) => cosineSimilarity(winner.embedding, rec.embedding) >= 0.995);
     const clearWinner = winner && (!runnerUp || winner.final_score - runnerUp.final_score >= 0.04);
-    if (winner && winner.technical_score >= 0.55 && (clearWinner || nearDuplicates)) {
+    if (winner && (taste ? !rejectOutright(winner) : winner.technical_score >= 0.55) && (clearWinner || nearDuplicates)) {
       decide(winner.photo_id, "pick");
       for (const rec of candidates) {
         if (!winnerPair.has(rec.photo_id) && cosineSimilarity(winner.embedding, rec.embedding) >= 0.9) decide(rec.photo_id, "reject");
@@ -144,7 +148,7 @@ export function buildAutoCullPlan(photos: Photo[], allPhotos: Photo[], session: 
     }
     for (const id of stack.photoIds) {
       const rec = analyzed.get(id);
-      if (hasEvidence(rec) && rec.technical_score <= 0.25) decide(id, "reject");
+      if (hasEvidence(rec) && rejectOutright(rec)) decide(id, "reject");
     }
   };
   const stacks = buildReviewQueue(photos, session);
