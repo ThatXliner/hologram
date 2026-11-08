@@ -163,7 +163,7 @@
 
     const actualLearner = $derived(session?.learner?.engine ?? "builtin");
     const applyBlocked = $derived(isAnalyzing || Boolean(analysisError) || analysisInterrupted || Boolean($xmpImportState.error) || $xmpImportState.syncing);
-    const learnerName = (learner: AutoCullLearner) => learner === "xgboost-native" ? "XGBoost" : "built-in";
+    const learnerName = (learner: AutoCullLearner) => learner === "xgboost-native" ? "XGBoost" : learner === "taste" ? "Taste model (beta)" : "built-in";
     const wide = $derived(innerWidth >= 1024);
     const photosById = $derived(new Map(photos.map((photo) => [photo.id, photo])));
     // Paired RAW files are hidden from the display list but share every decision.
@@ -1181,7 +1181,12 @@
                 {:else}
                     <span> · no decisions to learn from yet</span>
                 {/if}
-            {:else if session.learner?.fallback_reason}
+            {:else if session.learner?.engine === "taste"}
+                <span data-autocull-taste-status> · {session.learner.training_rows > 0
+                    ? `${session.learner.training_rows} reviewed photos from ${session.learner.shoots} shoot${session.learner.shoots === 1 ? "" : "s"} · personal weight ${session.learner.lambda}`
+                    : "no past reviews yet, using generic quality"} · rejects bottom {session.learner.reject_percent}%{session.learner.missing_embeddings
+                    ? ` · ${session.learner.missing_embeddings} photos not embedded` : ""}</span>
+            {:else if session.learner?.engine === "builtin" && session.learner.fallback_reason}
                 <span data-autocull-learner-fallback> · {session.learner.fallback_reason}</span>
             {/if}
         {/if}

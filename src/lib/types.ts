@@ -192,12 +192,14 @@ export interface AutoCullPairwisePreference {
   created_at: string;
 }
 
-export type AutoCullLearner = "builtin" | "xgboost-native";
+export type AutoCullLearner = "builtin" | "xgboost-native" | "taste";
 export type AutoCullLearnerPolicy = AutoCullLearner | "auto";
 
 export type AutoCullLearnerRun =
   | { engine: "builtin"; fallback_reason?: string }
-  | { engine: "xgboost-native"; version: "3.1.1"; training_rows: number; train_ms: number; predict_ms: number };
+  | { engine: "xgboost-native"; version: "3.1.1"; training_rows: number; train_ms: number; predict_ms: number }
+  | { engine: "taste"; version: string; lambda: number; shoots: number; training_rows: number; train_ms: number;
+      reject_percent: number; missing_embeddings: number };
 
 export interface AutoCullSession {
   learner?: AutoCullLearnerRun;

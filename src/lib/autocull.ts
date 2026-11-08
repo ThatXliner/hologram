@@ -14,6 +14,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { photoPreviewSrc } from "./photoPreview.ts";
 import { heavyMediaConcurrency } from "./concurrency.ts";
 import { nativeLearnerAvailable, nativeRankerRequest, scoreNativeRanker, NATIVE_RANKER_VERSION } from "./autocullNative.ts";
+import { clipEmbedding } from "./clipEmbedding.ts";
+import { fitTasteModel, scoreTasteModel, tasteLabel, TASTE_MODEL_VERSION, type TasteModel, type TasteRow } from "./tasteModel.ts";
 
 const DINO_MODEL_ID = "onnx-community/dinov2-small";
 const TRANSFORMER_EMBEDDING_BACKEND = "dinov2-small-transformersjs";
@@ -174,7 +176,11 @@ export type PreferenceFeatureSnapshot = {
   rankerFeatures: number[];
   embedding: number[];
   sourceGroup?: string;
+  // Opt-in taste model inputs: CLIP embedding plus the capture family and block within its shoot.
+  taste?: TasteSnapshot;
 };
+
+export type TasteSnapshot = { clip: number[]; family: string; block: string };
 
 export const PREFERENCE_FEATURE_VERSION = `${RANKER_VERSION}:${FEATURE_CACHE_VERSION}`;
 const preferenceFeatureMemory = new Map<string, PreferenceFeatureSnapshot>();
@@ -193,7 +199,15 @@ function isPreferenceFeatureSnapshot(value: unknown): value is PreferenceFeature
     && "backend" in value && typeof value.backend === "string"
     && (!("sourceGroup" in value) || value.sourceGroup === undefined || typeof value.sourceGroup === "string")
     && "rankerFeatures" in value && isFiniteVector(value.rankerFeatures, 11 + EMBEDDING_RANKER_FEATURES)
-    && "embedding" in value && isFiniteVector(value.embedding) && value.embedding.some((item) => item !== 0);
+    && "embedding" in value && isFiniteVector(value.embedding) && value.embedding.some((item) => item !== 0)
+    && (!("taste" in value) || value.taste === undefined || isTasteSnapshot(value.taste));
+}
+
+function isTasteSnapshot(value: unknown): value is TasteSnapshot {
+  return typeof value === "object" && value !== null
+    && "clip" in value && isFiniteVector(value.clip, 512)
+    && "family" in value && typeof value.family === "string"
+    && "block" in value && typeof value.block === "string";
 }
 
 async function makePreferenceSnapshot(photo: Photo, rankerFeatures: number[], pixels: PixelFeatures): Promise<PreferenceFeatureSnapshot> {
@@ -222,7 +236,8 @@ async function openPreferenceDb(): Promise<IDBDatabase | null> {
 
 async function persistPreferenceSnapshots(snapshots: PreferenceFeatureSnapshot[]): Promise<boolean> {
   const valid = snapshots.filter(isPreferenceFeatureSnapshot).map((snapshot) => ({ ...snapshot,
-    sourceGroup: snapshot.sourceGroup ?? preferenceFeatureMemory.get(snapshot.photoId)?.sourceGroup }));
+    sourceGroup: snapshot.sourceGroup ?? preferenceFeatureMemory.get(snapshot.photoId)?.sourceGroup,
+    taste: snapshot.taste ?? preferenceFeatureMemory.get(snapshot.photoId)?.taste }));
   for (const snapshot of valid) preferenceFeatureMemory.set(snapshot.photoId, snapshot);
   if (!valid.length) return true;
   const db = await openPreferenceDb();
@@ -235,8 +250,9 @@ async function persistPreferenceSnapshots(snapshots: PreferenceFeatureSnapshot[]
         const request = store.get(snapshot.photoId);
         request.onsuccess = () => {
           const previous: unknown = request.result;
-          const updated = { ...snapshot, sourceGroup: snapshot.sourceGroup
-            ?? (isPreferenceFeatureSnapshot(previous) ? previous.sourceGroup : undefined) };
+          const stored = isPreferenceFeatureSnapshot(previous) ? previous : undefined;
+          const updated = { ...snapshot, sourceGroup: snapshot.sourceGroup ?? stored?.sourceGroup,
+            taste: snapshot.taste ?? stored?.taste };
           preferenceFeatureMemory.set(updated.photoId, updated);
           store.put(updated);
         };
@@ -641,6 +657,7 @@ export async function buildAutoCullSession(
   profileId = DEFAULT_PREFERENCE_PROFILE_ID,
   learner: AutoCullLearnerPolicy = "auto",
   isCurrent: () => boolean = () => true,
+  tasteRejectFraction = 0.1,
 ): Promise<AutoCullSession> {
   if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
   const featuresById = new Map<string, PixelFeatures | null>();
@@ -686,7 +703,10 @@ export async function buildAutoCullSession(
   await preferenceWrites;
   const snapshots = await loadPreferenceFeatureSnapshots([...referencedIds]);
   if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
-  const session = learner === "auto"
+  const session = learner === "taste"
+    ? await rankAutoCullPhotosWithTaste(photos, featuresById, preferences, refinements, learnFromPhotoMetadata,
+      excludedTrainingIds, snapshots, metadataExcludedIds, referencedIds, tasteRejectFraction, onProgress, isCurrent)
+    : learner === "auto"
     ? await rankAutoCullPhotosAutomatically(photos, featuresById, preferences, refinements, learnFromPhotoMetadata,
       excludedTrainingIds, snapshots, metadataExcludedIds, scoreNativeRanker, nativeLearnerAvailable(), isCurrent)
     : await (learner === "xgboost-native" ? rankAutoCullPhotosWithNative : rankAutoCullPhotos)(
@@ -694,6 +714,133 @@ export async function buildAutoCullSession(
   if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
   onProgress({ current: total, total });
   return session;
+}
+
+// Capture family (RAW+JPEG siblings) and block: union of family, AutoCull's visual clusters and
+// captures taken within 2 s of each other, matching how the taste model was evaluated.
+export function tasteCaptureGroups(photos: Photo[], clusters: AutoCullSession["clusters"]): Map<string, { family: string; block: string }> {
+  const ids = new Set(photos.map((photo) => photo.id));
+  const parent = new Map([...ids].map((id) => [id, id]));
+  const root = (id: string): string => {
+    let current = id;
+    while (parent.get(current) !== current) current = parent.get(current)!;
+    parent.set(id, current);
+    return current;
+  };
+  const union = (left: string, right: string) => {
+    if (!ids.has(left) || !ids.has(right)) return;
+    const [a, b] = [root(left), root(right)].sort();
+    if (a !== b) parent.set(b, a);
+  };
+  for (const photo of photos) if (photo.paired_with) union(photo.id, photo.paired_with);
+  for (const cluster of clusters) for (const id of cluster.photo_ids.slice(1)) union(cluster.photo_ids[0], id);
+  const timed = photos.flatMap((photo) => {
+    const ms = captureTimestampMs(photo);
+    return ms === null ? [] : [{ id: photo.id, ms }];
+  }).sort((a, b) => a.ms - b.ms);
+  for (let index = 1; index < timed.length; index++) {
+    if (timed[index].ms - timed[index - 1].ms <= 2_000) union(timed[index - 1].id, timed[index].id);
+  }
+  return new Map(photos.map((photo) => [photo.id, {
+    family: photo.paired_with && ids.has(photo.paired_with) ? [photo.id, photo.paired_with].sort().join("|") : photo.id,
+    block: root(photo.id),
+  }]));
+}
+
+async function fitTasteModelOffThread(rows: TasteRow[], labels: number[]): Promise<TasteModel> {
+  if (typeof Worker === "undefined" || typeof window === "undefined") return fitTasteModel(rows, labels);
+  try {
+    const worker = new Worker(new URL("./tasteModel.worker.ts", import.meta.url), { type: "module" });
+    return await new Promise<TasteModel>((resolve, reject) => {
+      worker.onmessage = (event: MessageEvent<{ model?: TasteModel; error?: string }>) => {
+        worker.terminate();
+        if (event.data.model) resolve(event.data.model);
+        else reject(new Error(event.data.error ?? "Taste model failed"));
+      };
+      worker.onerror = (event) => {
+        worker.terminate();
+        reject(new Error(event.message));
+      };
+      worker.postMessage({ rows, labels });
+    });
+  } catch {
+    return fitTasteModel(rows, labels);
+  }
+}
+
+// Opt-in taste model: generic prior + personal residual learned across the user's past shoots.
+export async function rankAutoCullPhotosWithTaste(
+  photos: Photo[],
+  featuresById: Map<string, PixelFeatures | null>,
+  preferences: AutoCullPairwisePreference[],
+  refinements: AutoCullPreferenceRefinement[],
+  learnFromPhotoMetadata: boolean,
+  excludedTrainingIds: ReadonlySet<string>,
+  snapshots: ReadonlyMap<string, PreferenceFeatureSnapshot>,
+  metadataExcludedIds: ReadonlySet<string>,
+  referencedIds: ReadonlySet<string>,
+  rejectFraction: number,
+  onProgress: (progress: VisualIndexProgress) => void = () => {},
+  isCurrent: () => boolean = () => true,
+  embed: (photo: Photo) => Promise<number[] | null> = (photo) => {
+    const src = photoPreviewSrc(photo);
+    return src ? clipEmbedding(photo, () => loadImage(src)) : Promise.resolve(null);
+  },
+): Promise<AutoCullSession> {
+  const prepared = prepareAutoCullRanking(photos, featuresById, preferences, refinements, learnFromPhotoMetadata, excludedTrainingIds, snapshots, metadataExcludedIds);
+  const models = new Map([...prepared.batches].map(([backend, batch]) => [backend, { model: trainRankingModel(batch.examples, batch.pairs), count: batch.examples.length + batch.pairs.length }]));
+  const groups = tasteCaptureGroups(prepared.photos, finishAutoCullRanking(prepared, models, { engine: "builtin" }).clusters);
+
+  const clips = new Map<string, number[]>();
+  let embedded = 0;
+  await parallelForEach(prepared.photos, heavyMediaConcurrency(), async (photo) => {
+    const clip = await embed(photo);
+    if (clip) clips.set(photo.id, clip);
+    onProgress({ current: ++embedded, total: prepared.photos.length, current_file: photo.file_name });
+  });
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
+
+  const tasteSnapshots = await Promise.all(prepared.photos.filter((photo) => referencedIds.has(photo.id)
+    && !excludedTrainingIds.has(photo.id) && clips.has(photo.id)).map(async (photo) => {
+    const pixels = featuresById.get(photo.id);
+    const record = prepared.featureRecordsById.get(photo.id);
+    if (!pixels || !record) return [];
+    const snapshot = await makePreferenceSnapshot(photo, record.rankerFeatures, pixels);
+    return [{ ...snapshot, taste: { clip: clips.get(photo.id)!, ...groups.get(photo.id)! } }];
+  }));
+  preferenceWrites = preferenceWrites.then(() => isCurrent() ? persistPreferenceSnapshots(tasteSnapshots.flat()) : false);
+  await preferenceWrites;
+  const history = await loadPreferenceFeatureSnapshots([...referencedIds]);
+
+  const labels = new Map<string, 1 | 0 | null>();
+  for (const item of refinements) {
+    if (!excludedTrainingIds.has(item.photo_id) && !metadataExcludedIds.has(item.photo_id)) labels.set(item.photo_id, tasteLabel(item.flag, item.rating));
+  }
+  const rows: TasteRow[] = [];
+  const rowLabels: number[] = [];
+  for (const [id, label] of labels) {
+    const snapshot = history.get(id);
+    if (label === null || !snapshot?.taste) continue;
+    rows.push({ id, shoot: snapshot.sourceGroup ?? "unknown", family: snapshot.taste.family, block: snapshot.taste.block,
+      technical: snapshot.rankerFeatures[0], clip: snapshot.taste.clip });
+    rowLabels.push(label);
+  }
+  const started = performance.now();
+  const model = await fitTasteModelOffThread(rows, rowLabels);
+  const trainMs = performance.now() - started;
+  if (!isCurrent()) throw new Error("Analysis was superseded by newer choices");
+
+  const targets = prepared.photos.filter((photo) => clips.has(photo.id)).map((photo): TasteRow => ({
+    id: photo.id, shoot: "target", ...groups.get(photo.id)!, clip: clips.get(photo.id)!,
+    technical: prepared.featureRecordsById.get(photo.id)?.technicalScore ?? fallbackTechnicalScore(photo),
+  }));
+  const rejectScores = targets.length ? scoreTasteModel(model, targets) : [];
+  const order = rejectScores.map((_, index) => index).sort((a, b) => rejectScores[b] - rejectScores[a]);
+  const keep = new Map(order.map((index, rank) => [targets[index].id, (rank + 0.5) / order.length]));
+  const learner: AutoCullLearnerRun = { engine: "taste", version: TASTE_MODEL_VERSION, lambda: model.lambda, shoots: model.shoots,
+    training_rows: model.trainingRows, train_ms: trainMs, reject_percent: Math.round(rejectFraction * 100),
+    missing_embeddings: prepared.photos.length - targets.length };
+  return finishAutoCullRanking(prepared, models, learner, { keep, rejectFraction });
 }
 
 function prepareAutoCullRanking(
@@ -803,10 +950,13 @@ export async function rankAutoCullPhotosAutomatically(
   return session;
 }
 
+// taste: keep-percentile within the shoot from the opt-in taste model, replacing the score and
+// label bands; explicit flags still decide their own labels.
 function finishAutoCullRanking(
   prepared: ReturnType<typeof prepareAutoCullRanking>,
   models: Map<string, { model: RankingModel; count: number }>,
   learner: AutoCullLearnerRun,
+  taste?: { keep: Map<string, number>; rejectFraction: number },
 ): AutoCullSession {
   const { photos, featureRecordsById } = prepared;
   const trainingCount = [...models.values()].reduce((sum, item) => sum + item.count, 0);
@@ -829,6 +979,26 @@ function finishAutoCullRanking(
         + behaviorSignalValue,
     );
     const finalScore = blendScores(technicalScore, personalScore);
+    const keep = taste?.keep.get(photo.id);
+    if (taste && keep !== undefined) {
+      return {
+        source: photo,
+        photo_id: photo.id,
+        cluster_id: "",
+        technical_score: technicalScore,
+        personal_score: keep,
+        final_score: keep,
+        behavior_signal: behaviorSignalValue,
+        recommendation: tasteRecommendation(photo, keep, taste.rejectFraction),
+        confidence: recommendationConfidence(photo, keep, embedding),
+        reasons: [`Taste model: ranks above ${Math.round(keep * 100)}% of this shoot`],
+        embedding,
+        embedding_backend: record?.embedding ? record.backend : undefined,
+        captureMs: captureTimestampMs(photo),
+        sortTimeMs: sortTimestampMs(photo),
+        sequence: filenameSequence(photo.file_name),
+      } satisfies ScoredPhoto;
+    }
     return {
       source: photo,
       photo_id: photo.id,
@@ -867,7 +1037,7 @@ function finishAutoCullRanking(
   }) => photo);
   return {
     embedding_backend: EMBEDDING_BACKEND,
-    ranker_version: learner.engine === "xgboost-native" ? NATIVE_RANKER_VERSION : RANKER_VERSION,
+    ranker_version: learner.engine === "xgboost-native" ? NATIVE_RANKER_VERSION : learner.engine === "taste" ? TASTE_MODEL_VERSION : RANKER_VERSION,
     learner,
     generated_at: new Date().toISOString(),
     photos: outputPhotos,
@@ -2224,6 +2394,16 @@ export function pointwiseSignal(flag: CullFlag, rating: number): number {
   if (flag === "pick") return clamp01(Math.max(0.78, ratingSignal));
   if (flag === "reject") return clamp01(Math.min(0.18, ratingSignal * 0.35));
   return clamp01(ratingSignal);
+}
+
+function tasteRecommendation(photo: Photo, keep: number, rejectFraction: number): AutoCullLabel {
+  const flag = normalizeFlag(photo.flag);
+  if (flag === "reject") return "REJECT";
+  if (flag === "pick" || (photo.rating ?? 0) >= 4) return "SELECT";
+  if (keep < rejectFraction) return "REJECT";
+  if (keep < rejectFraction + 0.1) return "NEEDS_REVIEW";
+  if (keep >= 0.85) return "SELECT";
+  return "MAYBE";
 }
 
 function recommendationFor(photo: Photo, finalScore: number, personalScore: number, hasPixels: boolean): AutoCullLabel {
