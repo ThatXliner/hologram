@@ -11,6 +11,8 @@
       "allow": [{ "path": "**" }]
     },
     "dialog:allow-open",
-    "dialog:default"
+    "dialog:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }
