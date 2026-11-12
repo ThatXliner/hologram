@@ -57,7 +57,7 @@
         }
     });
 
-    const detailOptions:{ value: GridDetails; label: string; description: string }[] = [
+    const detailOptions: { value: GridDetails; label: string; description: string }[] = [
         { value: "image", label: "Images only", description: "Show the largest possible previews." },
         { value: "essentials", label: "Essentials", description: "Show filenames and ratings." },
         { value: "metadata", label: "Full metadata", description: "Show filenames, ratings, and exposure details." },
@@ -199,13 +199,13 @@
                     <h2 class="text-sm font-semibold text-foreground">Updates</h2>
                     <p class="mt-0.5 text-xs text-muted-foreground">Hologram {appVersion || "..."}. Updates are signed and installed from GitHub releases.</p>
                 </div>
-                <button class="ui-control shrink-0" disabled={busy} onclick={() => checkForUpdates({ silent: false })}>Check for updates</button>
+                <button class="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-border px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" disabled={busy} onclick={() => checkForUpdates({ silent: false })}>Check for updates</button>
             </div>
             {#if statusLine}
                 <div class="flex items-center gap-3 border-t border-border p-4">
                     <p class="min-w-0 flex-1 text-xs {status.kind === 'error' ? 'text-destructive' : 'text-muted-foreground'}" role="status">{statusLine}</p>
                     {#if status.kind === "available"}
-                        <button class="ui-control shrink-0" onclick={() => installUpdate()}>Install and restart</button>
+                        <button class="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-border px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" onclick={() => installUpdate()}>Install and restart</button>
                     {/if}
                 </div>
             {/if}
