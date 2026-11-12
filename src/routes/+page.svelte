@@ -18,6 +18,7 @@
     import ExportPanel from "../lib/components/ExportPanel.svelte";
     import SettingsPanel from "../lib/components/SettingsPanel.svelte";
     import { loadTasteSettings, saveTasteSettings } from "../lib/tasteSettings.ts";
+    import { checkForUpdates, updates } from "../lib/updates.svelte.ts";
     import { HologramAPI } from "../lib/api.ts";
     import { buildSmartCollections } from "../lib/collections.ts";
     import { indexPhotoVisuals } from "../lib/visualIndex.ts";
@@ -322,6 +323,7 @@
 
     onMount(() => {
         showSidebar = window.innerWidth >= 1100;
+        void checkForUpdates({ silent: true });
         loadSavedSearches();
         loadSmartCollectionState();
         loadGridPreferences();
@@ -714,7 +716,7 @@
 
 <svelte:window onkeydown={handleLibraryKeydown} onpointerdown={(event) => { if (viewOptions?.open && !viewOptions.contains(event.target as Node)) viewOptions.open = false; }} />
 
-{#snippet railBtn(Icon: any, active: boolean, label: string, onclick: () => void, disabled = false, shortcut = "")}
+{#snippet railBtn(Icon: any, active: boolean, label: string, onclick: () => void, disabled = false, shortcut = "", badge = false)}
     <button
         class="relative flex h-[60px] w-16 flex-col items-center justify-center gap-1.5 rounded-lg text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-35 {active ? 'bg-secondary text-primary' : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground'}"
         {onclick}
@@ -726,6 +728,9 @@
     >
         <Icon size={19} />
         <span>{label}</span>
+        {#if badge}
+            <span class="absolute right-3 top-2.5 h-2 w-2 rounded-full bg-primary" aria-hidden="true"></span>
+        {/if}
     </button>
 {/snippet}
 
@@ -757,7 +762,7 @@
         {@render railBtn(Download, effectiveRail === "export", "Export", openLibraryExport, !hasLibrary, `${shortcutMod}3`)}
         <div class="flex-1"></div>
         {@render railBtn(Keyboard, false, "Shortcuts", () => shortcutsDialog?.showModal(), false, "?")}
-        {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"), false, `${shortcutMod},`)}
+        {@render railBtn(Settings, effectiveRail === "settings", "Settings", () => (railView = "settings"), false, `${shortcutMod},`, updates.status.kind === "available")}
     </nav>
 
     {#if autoCullVisited && hasLibrary}
