@@ -1,6 +1,9 @@
 <script lang="ts">
-    import { Brain, LayoutGrid, RotateCcw, Settings, Sparkles } from "@lucide/svelte";
+    import { Brain, LayoutGrid, RefreshCw, RotateCcw, Settings, Sparkles } from "@lucide/svelte";
+    import { getVersion } from "@tauri-apps/api/app";
+    import { onMount } from "svelte";
     import { MAX_REJECT_PERCENT, type TasteSettings } from "../tasteSettings.ts";
+    import { checkForUpdates, installUpdate, updates } from "../updates.svelte.ts";
 
     type GridDetails = "image" | "essentials" | "metadata";
 
@@ -32,7 +35,29 @@
         onResetGridPreferences,
     }: Props = $props();
 
-    const detailOptions: { value: GridDetails; label: string; description: string }[] = [
+    let appVersion = $state("");
+    onMount(() => {
+        getVersion().then((version) => (appVersion = version)).catch(() => {});
+    });
+
+    const status = $derived(updates.status);
+    const busy = $derived(status.kind === "checking" || status.kind === "downloading" || status.kind === "ready");
+    const statusLine = $derived.by(() => {
+        switch (status.kind) {
+            case "idle": return "";
+            case "checking": return "Checking for updates...";
+            case "upToDate": return "Hologram is up to date.";
+            case "available": return `Hologram ${status.version} is available.`;
+            case "downloading": {
+                const percent = status.total ? ` ${Math.min(100, Math.round((status.downloaded / status.total) * 100))}%` : "";
+                return `Downloading update...${percent}`;
+            }
+            case "ready": return "Update installed. Restarting...";
+            case "error": return `Update failed: ${status.message}`;
+        }
+    });
+
+    const detailOptions:{ value: GridDetails; label: string; description: string }[] = [
         { value: "image", label: "Images only", description: "Show the largest possible previews." },
         { value: "essentials", label: "Essentials", description: "Show filenames and ratings." },
         { value: "metadata", label: "Full metadata", description: "Show filenames, ratings, and exposure details." },
@@ -161,6 +186,27 @@
                         />
                     </label>
                     <p class="mt-2 text-[11px] leading-4 text-muted-foreground">How much of each shoot AutoCull marks as reject, lowest-ranked first. The next 10% are marked for review. Shoots differ a lot, so start low; you can undo any mark.</p>
+                </div>
+            {/if}
+        </section>
+
+        <section class="rounded-lg border border-border bg-card" data-update-settings>
+            <div class="flex items-center gap-3 p-4">
+                <div class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-primary/15 text-primary">
+                    <RefreshCw size={17} />
+                </div>
+                <div class="min-w-0 flex-1">
+                    <h2 class="text-sm font-semibold text-foreground">Updates</h2>
+                    <p class="mt-0.5 text-xs text-muted-foreground">Hologram {appVersion || "..."}. Updates are signed and installed from GitHub releases.</p>
+                </div>
+                <button class="ui-control shrink-0" disabled={busy} onclick={() => checkForUpdates({ silent: false })}>Check for updates</button>
+            </div>
+            {#if statusLine}
+                <div class="flex items-center gap-3 border-t border-border p-4">
+                    <p class="min-w-0 flex-1 text-xs {status.kind === 'error' ? 'text-destructive' : 'text-muted-foreground'}" role="status">{statusLine}</p>
+                    {#if status.kind === "available"}
+                        <button class="ui-control shrink-0" onclick={() => installUpdate()}>Install and restart</button>
+                    {/if}
                 </div>
             {/if}
         </section>
